@@ -89,10 +89,20 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.to_async(Runtime::new().unwrap()).iter(|| {
             query3(
                 ctx.clone(),
-                "SELECT a, b, array_agg(distinct c), sum(d) FROM t group by a, b",
+                "SELECT a, b, array_agg(c), sum(d) FROM t group by a, b",
             )
         })
     });
+
+    // c.bench_function("no-array-agg", |b| {
+    //     b.to_async(Runtime::new().unwrap()).iter(|| {
+    //         query3(
+    //             ctx.clone(),
+    //             "SELECT a, b, sum(d) FROM t group by a, b",
+    //         )
+    //     })
+    // });
+
 }
 
 criterion_group!(benches, criterion_benchmark);
