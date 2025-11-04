@@ -22,17 +22,29 @@ extern crate datafusion;
 
 mod data_utils;
 use crate::criterion::Criterion;
-use data_utils::create_table_provider;
+use data_utils::{create_table_provider, create_table_provider_2};
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use criterion::async_executor::FuturesExecutor;
 use tokio::runtime::Runtime;
 
 fn query(ctx: Arc<Mutex<SessionContext>>, rt: &Runtime, sql: &str) {
     let df = rt.block_on(ctx.lock().sql(sql)).unwrap();
     criterion::black_box(rt.block_on(df.collect()).unwrap());
 }
+
+async fn query3(ctx: Arc<Mutex<SessionContext>>, sql: &str) {
+    let df = ctx.lock().sql(sql).await.unwrap();
+    df.collect().await.unwrap();
+}
+
+async fn query_2(ctx: &SessionContext, sql: &str) {
+    let df = ctx.sql(sql).await.unwrap();
+    df.collect().await.unwrap();
+}
+
 
 fn create_context(
     partitions_len: usize,
@@ -45,179 +57,39 @@ fn create_context(
     Ok(Arc::new(Mutex::new(ctx)))
 }
 
+fn create_context_3(
+    partitions_len: usize,
+    array_len: usize,
+    batch_size: usize,
+) -> Result<Arc<Mutex<SessionContext>>> {
+    let ctx = SessionContext::new();
+    let provider = create_table_provider_2(partitions_len, array_len, batch_size)?;
+    ctx.register_table("t", provider)?;
+    Ok(Arc::new(Mutex::new(ctx)))
+}
+
+fn create_context_2(
+    partitions_len: usize,
+    array_len: usize,
+    batch_size: usize,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::new();
+    let provider = create_table_provider_2(partitions_len, array_len, batch_size)?;
+    ctx.register_table("t", provider)?;
+    Ok(ctx)
+}
+
 fn criterion_benchmark(c: &mut Criterion) {
     let partitions_len = 8;
     let array_len = 32768 * 2; // 2^16
     let batch_size = 2048; // 2^11
-    let ctx = create_context(partitions_len, array_len, batch_size).unwrap();
-    let rt = Runtime::new().unwrap();
+    let ctx = create_context_3(partitions_len, array_len, batch_size).unwrap();
 
-    c.bench_function("aggregate_query_no_group_by 15 12", |b| {
-        b.iter(|| {
-            query(
+    c.bench_function("array-agg", |b| {
+        b.to_async(Runtime::new().unwrap()).iter(|| {
+            query3(
                 ctx.clone(),
-                &rt,
-                "SELECT MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_no_group_by_min_max_f64", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT MIN(f64), MAX(f64) \
-                 FROM t",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_no_group_by_count_distinct_wide", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT COUNT(DISTINCT u64_wide) \
-                 FROM t",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_no_group_by_count_distinct_narrow", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT COUNT(DISTINCT u64_narrow) \
-                 FROM t",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_group_by", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT utf8, MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t GROUP BY utf8",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_group_by_with_filter", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT utf8, MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t \
-                 WHERE f32 > 10 AND f32 < 20 GROUP BY utf8",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_group_by_u64 15 12", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT u64_narrow, MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t GROUP BY u64_narrow",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_group_by_with_filter_u64 15 12", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT u64_narrow, MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t \
-                 WHERE f32 > 10 AND f32 < 20 GROUP BY u64_narrow",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_group_by_u64_multiple_keys", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT u64_wide, utf8, MIN(f64), AVG(f64), COUNT(f64) \
-                 FROM t GROUP BY u64_wide, utf8",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_approx_percentile_cont_on_u64", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT utf8, approx_percentile_cont(0.5, 2500) WITHIN GROUP (ORDER BY u64_wide)  \
-                 FROM t GROUP BY utf8",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_approx_percentile_cont_on_f32", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT utf8, approx_percentile_cont(0.5, 2500) WITHIN GROUP (ORDER BY f32)  \
-                 FROM t GROUP BY utf8",
-            )
-        })
-    });
-
-    c.bench_function("aggregate_query_distinct_median", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT MEDIAN(DISTINCT u64_wide), MEDIAN(DISTINCT u64_narrow) \
-                 FROM t",
-            )
-        })
-    });
-
-    c.bench_function("first_last_many_columns", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT first_value(u64_wide order by f64, u64_narrow, utf8),\
-                            last_value(u64_wide order by f64, u64_narrow, utf8)  \
-                 FROM t GROUP BY u64_narrow",
-            )
-        })
-    });
-
-    c.bench_function("first_last_ignore_nulls", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT first_value(u64_wide ignore nulls order by f64, u64_narrow, utf8),  \
-                            last_value(u64_wide ignore nulls order by f64, u64_narrow, utf8)    \
-                 FROM t GROUP BY u64_narrow",
-            )
-        })
-    });
-
-    c.bench_function("first_last_one_column", |b| {
-        b.iter(|| {
-            query(
-                ctx.clone(),
-                &rt,
-                "SELECT first_value(u64_wide order by f64), \
-                            last_value(u64_wide order by f64)   \
-                FROM t GROUP BY u64_narrow",
+                "SELECT a, b, array_agg(distinct c), sum(d) FROM t group by a, b",
             )
         })
     });
@@ -225,3 +97,24 @@ fn criterion_benchmark(c: &mut Criterion) {
 
 criterion_group!(benches, criterion_benchmark);
 criterion_main!(benches);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_blah() {
+        let partitions_len = 8;
+        let array_len = 32768 * 2; // 2^16
+        let batch_size = 2048; // 2^11
+        let ctx = create_context_2(partitions_len, array_len, batch_size).unwrap();
+        for _ in 0..100000 {
+            let _ = query_2(
+                &ctx,
+                "SELECT a, b, array_agg(distinct), sum(d) \
+                 FROM t",
+            );
+        }
+
+    }
+}

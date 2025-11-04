@@ -182,77 +182,81 @@ nix = { version = "0.30.1", features = ["fs"] }
 [[bench]]
 harness = false
 name = "aggregate_query_sql"
-
-[[bench]]
-harness = false
-name = "csv_load"
-
-[[bench]]
-harness = false
-name = "distinct_query_sql"
-
-[[bench]]
-harness = false
-name = "push_down_filter"
-
-[[bench]]
-harness = false
-name = "sort_limit_query_sql"
-
-[[bench]]
-harness = false
-name = "math_query_sql"
-
-[[bench]]
-harness = false
-name = "filter_query_sql"
-
-[[bench]]
-harness = false
-name = "struct_query_sql"
-
-[[bench]]
-harness = false
-name = "window_query_sql"
-
-[[bench]]
-harness = false
-name = "scalar"
-
-[[bench]]
-harness = false
-name = "physical_plan"
-
-[[bench]]
-harness = false
-name = "parquet_query_sql"
-required-features = ["parquet"]
-
-[[bench]]
-harness = false
-name = "sql_planner"
-
-[[bench]]
-harness = false
-name = "sql_query_with_io"
-
-[[bench]]
-harness = false
-name = "sort"
-
-[[bench]]
-harness = false
-name = "topk_aggregate"
-
-[[bench]]
-harness = false
-name = "map_query_sql"
-required-features = ["nested_expressions"]
-
-[[bench]]
-harness = false
-name = "dataframe"
-
-[[bench]]
-harness = false
-name = "spm"
+#
+#[[bench]]
+#harness = false
+#name = "csv_load"
+#
+#[[bench]]
+#harness = false
+#name = "distinct_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "push_down_filter"
+#
+#[[bench]]
+#harness = false
+#name = "sort_limit_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "math_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "filter_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "struct_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "window_query_sql"
+#
+#[[bench]]
+#harness = false
+#name = "scalar"
+#
+#[[bench]]
+#harness = false
+#name = "physical_plan"
+#
+#[[bench]]
+#harness = false
+#name = "parquet_query_sql"
+#required-features = ["parquet"]
+#
+#[[bench]]
+#harness = false
+#name = "sql_planner"
+#
+#[[bench]]
+#harness = false
+#name = "sql_query_with_io"
+#
+#[[bench]]
+#harness = false
+#name = "sort"
+#
+#[[bench]]
+#harness = false
+#name = "topk_aggregate"
+#
+#[[bench]]
+#harness = false
+#name = "map_query_sql"
+#required-features = ["nested_expressions"]
+#
+#[[bench]]
+#harness = false
+#name = "dataframe"
+#
+#[[bench]]
+#harness = false
+#name = "spm"
+#
+[profile.release]
+debug = true
+strip = false

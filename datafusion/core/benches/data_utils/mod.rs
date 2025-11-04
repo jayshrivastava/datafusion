@@ -19,7 +19,7 @@
 
 use arrow::array::{
     builder::{Int64Builder, StringBuilder},
-    ArrayRef, Float32Array, Float64Array, RecordBatch, StringArray, StringViewBuilder,
+    ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray, StringViewBuilder,
     UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -49,6 +49,31 @@ pub fn create_table_provider(
     MemTable::try_new(schema, partitions).map(Arc::new)
 }
 
+
+/// create an in-memory table given the partition len, array len, and batch size,
+/// and the result table will be of array_len in total, and then partitioned, and batched.
+#[allow(dead_code)]
+pub fn create_table_provider_2(
+    partitions_len: usize,
+    array_len: usize,
+    batch_size: usize,
+) -> Result<Arc<MemTable>> {
+    let schema = Arc::new(create_schema_2());
+    let partitions =
+        create_record_batches(schema.clone(), array_len, partitions_len, batch_size);
+    // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
+    MemTable::try_new(schema, partitions).map(Arc::new)
+}
+
+/// Create test data schema
+pub fn create_schema_2() -> Schema {
+    Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+        Field::new("c", DataType::List(Arc::new(Field::new("asdf", DataType::Int64, false))), false),
+        Field::new("d", DataType::Int64, false),
+    ])
+}
 /// Create test data schema
 pub fn create_schema() -> Schema {
     Schema::new(vec![
@@ -102,38 +127,79 @@ fn create_record_batch(
     batch_size: usize,
     i: usize,
 ) -> RecordBatch {
-    // the 4 here is the number of different keys.
-    // a higher number increase sparseness
-    let vs = [0, 1, 2, 3];
-    let keys: Vec<String> = (0..batch_size)
-        .map(
-            // use random numbers to avoid spurious compiler optimizations wrt to branching
-            |_| format!("hi{:?}", vs.choose(rng)),
+    // Check if this is schema_2 by looking at the first field name
+    if schema.fields().len() == 4 && schema.field(0).name() == "a" {
+        // Handle create_schema_2 format: a(Int64), b(Int64), c(List<Int64>), d(Int64)
+        let a_values: Vec<i64> = (0..batch_size).map(|_| rng.random_range(0..100)).collect();
+        let b_values: Vec<i64> = (0..batch_size).map(|_| rng.random_range(0..100)).collect();
+        let d_values: Vec<i64> = (0..batch_size).map(|_| rng.random_range(0..100)).collect();
+        
+        // Create list arrays for field c
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+        
+        let mut list_values = Vec::new();
+        let mut offsets = vec![0i32];
+        for _ in 0..batch_size {
+            let list_len = rng.random_range(1..5); // 1 to 4 elements per list
+            for _ in 0..list_len {
+                list_values.push(rng.random_range(0..50));
+            }
+            offsets.push(list_values.len() as i32);
+        }
+        
+        let values_array = Arc::new(Int64Array::from(list_values));
+        let offsets_buffer = OffsetBuffer::new(offsets.into());
+        let list_array = ListArray::new(
+            Arc::new(Field::new("asdf", DataType::Int64, false)),
+            offsets_buffer,
+            values_array,
+            None,
+        );
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(a_values)),
+                Arc::new(Int64Array::from(b_values)),
+                Arc::new(list_array),
+                Arc::new(Int64Array::from(d_values)),
+            ],
         )
-        .collect();
-    let keys: Vec<&str> = keys.iter().map(|e| &**e).collect();
+        .unwrap()
+    } else {
+        // Handle original create_schema format: utf8, f32, f64, u64_wide, u64_narrow
+        let vs = [0, 1, 2, 3];
+        let keys: Vec<String> = (0..batch_size)
+            .map(
+                // use random numbers to avoid spurious compiler optimizations wrt to branching
+                |_| format!("hi{:?}", vs.choose(rng)),
+            )
+            .collect();
+        let keys: Vec<&str> = keys.iter().map(|e| &**e).collect();
 
-    let values = create_data(batch_size, 0.5);
+        let values = create_data(batch_size, 0.5);
 
-    // Integer values between [0, u64::MAX].
-    let integer_values_wide = create_integer_data(batch_size, 9.0);
+        // Integer values between [0, u64::MAX].
+        let integer_values_wide = create_integer_data(batch_size, 9.0);
 
-    // Integer values between [0, 9].
-    let integer_values_narrow = (0..batch_size)
-        .map(|_| rng.random_range(0_u64..10))
-        .collect::<Vec<_>>();
+        // Integer values between [0, 9].
+        let integer_values_narrow = (0..batch_size)
+            .map(|_| rng.random_range(0_u64..10))
+            .collect::<Vec<_>>();
 
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(keys)),
-            Arc::new(Float32Array::from(vec![i as f32; batch_size])),
-            Arc::new(Float64Array::from(values)),
-            Arc::new(UInt64Array::from(integer_values_wide)),
-            Arc::new(UInt64Array::from(integer_values_narrow)),
-        ],
-    )
-    .unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Float32Array::from(vec![i as f32; batch_size])),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(UInt64Array::from(integer_values_wide)),
+                Arc::new(UInt64Array::from(integer_values_narrow)),
+            ],
+        )
+        .unwrap()
+    }
 }
 
 /// Create record batches of `partitions_len` partitions and `batch_size` for each batch,
