@@ -1263,6 +1263,7 @@ impl protobuf::PhysicalPlanNode {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let physical_schema_ref = Arc::clone(&physical_schema);
         let agg = AggregateExec::try_new(
             agg_mode,
             PhysicalGroupBy::new(group_expr, null_expr, groups, has_grouping_set),
@@ -1272,7 +1273,7 @@ impl protobuf::PhysicalPlanNode {
             physical_schema,
         )?;
 
-        let agg = if let Some(limit_proto) = &hash_agg.limit {
+        let mut agg = if let Some(limit_proto) = &hash_agg.limit {
             let limit = limit_proto.limit as usize;
             let limit_options = match limit_proto.descending {
                 Some(descending) => LimitOptions::new_with_order(limit, descending),
@@ -1282,6 +1283,20 @@ impl protobuf::PhysicalPlanNode {
         } else {
             agg
         };
+
+        if let Some(dynamic_filter_proto) = &hash_agg.dynamic_filter {
+            let dynamic_filter_expr = proto_converter.proto_to_physical_expr(
+                dynamic_filter_proto,
+                ctx,
+                physical_schema_ref.as_ref(),
+                codec,
+            )?;
+            if let Ok(df) = (dynamic_filter_expr as Arc<dyn Any + Send + Sync>)
+                .downcast::<DynamicFilterPhysicalExpr>()
+            {
+                agg.set_dynamic_filter(df);
+            }
+        }
 
         Ok(Arc::new(agg))
     }
@@ -1393,7 +1408,7 @@ impl protobuf::PhysicalPlanNode {
         } else {
             None
         };
-        Ok(Arc::new(HashJoinExec::try_new(
+        let mut hash_join = HashJoinExec::try_new(
             left,
             right,
             on,
@@ -1403,7 +1418,23 @@ impl protobuf::PhysicalPlanNode {
             partition_mode,
             null_equality.into(),
             hashjoin.null_aware,
-        )?))
+        )?;
+
+        if let Some(dynamic_filter_proto) = &hashjoin.dynamic_filter {
+            let dynamic_filter_expr = proto_converter.proto_to_physical_expr(
+                dynamic_filter_proto,
+                ctx,
+                right_schema.as_ref(),
+                codec,
+            )?;
+            if let Ok(df) = (dynamic_filter_expr as Arc<dyn Any + Send + Sync>)
+                .downcast::<DynamicFilterPhysicalExpr>()
+            {
+                hash_join = hash_join.with_dynamic_filter(df);
+            }
+        }
+
+        Ok(Arc::new(hash_join))
     }
 
     fn try_into_symmetric_hash_join_physical_plan(
@@ -1651,9 +1682,23 @@ impl protobuf::PhysicalPlanNode {
             return internal_err!("SortExec requires an ordering");
         };
         let fetch = (sort.fetch >= 0).then_some(sort.fetch as _);
-        let new_sort = SortExec::new(ordering, input)
+        let mut new_sort = SortExec::new(ordering, input)
             .with_fetch(fetch)
             .with_preserve_partitioning(sort.preserve_partitioning);
+
+        if let Some(dynamic_filter_proto) = &sort.dynamic_filter {
+            let dynamic_filter_expr = proto_converter.proto_to_physical_expr(
+                dynamic_filter_proto,
+                ctx,
+                new_sort.input().schema().as_ref(),
+                codec,
+            )?;
+            if let Ok(df) = (dynamic_filter_expr as Arc<dyn Any + Send + Sync>)
+                .downcast::<DynamicFilterPhysicalExpr>()
+            {
+                new_sort.set_dynamic_filter(df);
+            }
+        }
 
         Ok(Arc::new(new_sort))
     }
@@ -2433,6 +2478,15 @@ impl protobuf::PhysicalPlanNode {
             PartitionMode::Auto => protobuf::PartitionMode::Auto,
         };
 
+        let dynamic_filter = exec
+            .dynamic_filter()
+            .map(|df| {
+                let df_expr: Arc<dyn PhysicalExpr> =
+                    Arc::clone(df) as Arc<dyn PhysicalExpr>;
+                proto_converter.physical_expr_to_proto(&df_expr, codec)
+            })
+            .transpose()?;
+
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
                 protobuf::HashJoinExecNode {
@@ -2447,6 +2501,7 @@ impl protobuf::PhysicalPlanNode {
                         v.iter().map(|x| *x as u32).collect::<Vec<u32>>()
                     }),
                     null_aware: exec.null_aware,
+                    dynamic_filter,
                 },
             ))),
         })
@@ -2776,6 +2831,14 @@ impl protobuf::PhysicalPlanNode {
                     groups,
                     limit,
                     has_grouping_set: exec.group_expr().has_grouping_set(),
+                    dynamic_filter: exec
+                        .dynamic_filter()
+                        .map(|df| {
+                            let df_expr: Arc<dyn PhysicalExpr> =
+                                Arc::clone(df) as Arc<dyn PhysicalExpr>;
+                            proto_converter.physical_expr_to_proto(&df_expr, codec)
+                        })
+                        .transpose()?,
                 },
             ))),
         })
@@ -3071,6 +3134,14 @@ impl protobuf::PhysicalPlanNode {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let dynamic_filter = exec
+            .dynamic_filter()
+            .map(|df| {
+                let df_expr: Arc<dyn PhysicalExpr> = df as Arc<dyn PhysicalExpr>;
+                proto_converter.physical_expr_to_proto(&df_expr, codec)
+            })
+            .transpose()?;
+
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::Sort(Box::new(
                 protobuf::SortExecNode {
@@ -3081,6 +3152,7 @@ impl protobuf::PhysicalPlanNode {
                         _ => -1,
                     },
                     preserve_partitioning: exec.preserve_partitioning(),
+                    dynamic_filter,
                 },
             ))),
         })

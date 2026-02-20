@@ -801,12 +801,25 @@ impl HashJoinExec {
     }
 
     /// Get the dynamic filter expression for testing purposes.
-    /// Returns `None` if no dynamic filter has been set.
+    /// Returns the dynamic filter expression for this hash join, if set.
     ///
-    /// This method is intended for testing only and should not be used in production code.
-    #[doc(hidden)]
-    pub fn dynamic_filter_for_test(&self) -> Option<&Arc<DynamicFilterPhysicalExpr>> {
+    /// The dynamic filter is set during filter pushdown optimization when a child
+    /// (data source) accepts the pushed-down filter. It is used to push build-side
+    /// information (e.g., hash table values, bounds) to the probe side at runtime.
+    pub fn dynamic_filter(&self) -> Option<&Arc<DynamicFilterPhysicalExpr>> {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
+    }
+
+    /// Set the dynamic filter on this hash join.
+    ///
+    /// This is used during deserialization to restore the dynamic filter that was
+    /// serialized alongside the plan.
+    pub fn with_dynamic_filter(mut self, filter: Arc<DynamicFilterPhysicalExpr>) -> Self {
+        self.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter,
+            build_accumulator: OnceLock::new(),
+        });
+        self
     }
 
     /// Calculate order preservation flags for this hash join.

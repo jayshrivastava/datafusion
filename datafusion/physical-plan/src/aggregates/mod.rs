@@ -1036,6 +1036,27 @@ impl AggregateExec {
         &self.input_order_mode
     }
 
+    /// Returns the dynamic filter expression for this aggregate, if set.
+    ///
+    /// The dynamic filter is created for partial aggregates that compute
+    /// MIN/MAX over a single column. It is used to push bounds information
+    /// to the data source for pruning.
+    pub fn dynamic_filter(&self) -> Option<&Arc<DynamicFilterPhysicalExpr>> {
+        self.dynamic_filter.as_ref().map(|df| &df.filter)
+    }
+
+    /// Replace the dynamic filter expression while keeping the accumulator info.
+    /// This is used during deserialization to link the aggregate's dynamic filter
+    /// with the same inner state as the child data source's filter.
+    pub fn set_dynamic_filter(&mut self, filter: Arc<DynamicFilterPhysicalExpr>) {
+        if let Some(df) = &self.dynamic_filter {
+            self.dynamic_filter = Some(Arc::new(AggrDynFilter {
+                filter,
+                supported_accumulators_info: df.supported_accumulators_info.clone(),
+            }));
+        }
+    }
+
     fn statistics_inner(&self, child_statistics: &Statistics) -> Result<Statistics> {
         // TODO stats: group expressions:
         // - once expressions will be able to compute their own stats, use it here

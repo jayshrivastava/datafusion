@@ -3340,3 +3340,309 @@ fn test_session_id_rotation_with_execution_plans() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that a HashJoinExec with a dynamic filter pushed down to the probe side
+/// can be serialized and deserialized, preserving the shared inner state between
+/// the hash join's dynamic filter and the data source's predicate.
+#[test]
+fn test_hash_join_with_dynamic_filter_roundtrip() -> Result<()> {
+    let left_schema =
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let right_schema =
+        Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)]));
+
+    // Join on left.a = right.b
+    let left_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let right_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 0));
+    let on = vec![(Arc::clone(&left_col), Arc::clone(&right_col))];
+
+    // Create a dynamic filter for the probe (right) side, as HashJoinExec would
+    // during filter pushdown. The children are the probe-side join keys.
+    let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&right_col)],
+        lit(true),
+    ));
+
+    // The right child has the same dynamic filter as its predicate,
+    // simulating what happens after filter pushdown when the data source
+    // accepts the pushed-down filter.
+    let right_child = Arc::new(FilterExec::try_new(
+        Arc::clone(&dynamic_filter) as Arc<dyn PhysicalExpr>,
+        Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+    )?) as Arc<dyn ExecutionPlan>;
+
+    // Build the HashJoinExec with the dynamic filter set.
+    let hash_join = HashJoinExec::try_new(
+        Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+        right_child,
+        on,
+        None,
+        &JoinType::Inner,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?
+    .with_dynamic_filter(Arc::clone(&dynamic_filter));
+
+    let plan = Arc::new(hash_join) as Arc<dyn ExecutionPlan>;
+
+    // Roundtrip using the DeduplicatingProtoConverter so that dynamic filter
+    // inner state deduplication is applied.
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let converter = DeduplicatingProtoConverter {};
+    let deserialized = roundtrip_test_and_return(plan, &ctx, &codec, &converter)?;
+
+    // Extract the deserialized HashJoinExec and its dynamic filter.
+    let deserialized_join = deserialized
+        .as_any()
+        .downcast_ref::<HashJoinExec>()
+        .expect("Should be HashJoinExec");
+
+    let deserialized_hash_join_df = deserialized_join
+        .dynamic_filter()
+        .expect("HashJoinExec should have a dynamic filter after roundtrip");
+
+    // Extract the dynamic filter from the right child (FilterExec predicate).
+    let deserialized_right_filter = deserialized_join
+        .right()
+        .as_any()
+        .downcast_ref::<FilterExec>()
+        .expect("Right child should be FilterExec");
+    let deserialized_predicate_df = deserialized_right_filter
+        .predicate()
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Predicate should be DynamicFilterPhysicalExpr");
+
+    // The key assertion: after roundtrip, the HashJoinExec's dynamic filter
+    // and the FilterExec's predicate should share the same inner state.
+    // This is critical for the dynamic filter to work at runtime: the
+    // HashJoinExec updates the filter, and the data source reads from it.
+    assert_eq!(
+        deserialized_hash_join_df.inner_id(),
+        deserialized_predicate_df.inner_id(),
+        "HashJoinExec's dynamic filter should share inner state with the probe side's predicate"
+    );
+
+    // Verify that the snapshot state matches the original.
+    let original_snapshot = DynamicFilterSnapshot::from(dynamic_filter.as_ref());
+    let deserialized_snapshot =
+        DynamicFilterSnapshot::from(deserialized_hash_join_df.as_ref());
+    assert_eq!(
+        original_snapshot.to_string(),
+        deserialized_snapshot.to_string(),
+        "Dynamic filter snapshot should be preserved after roundtrip"
+    );
+
+    Ok(())
+}
+
+/// Test that an AggregateExec with a dynamic filter pushed down to the child
+/// can be serialized and deserialized, preserving the shared inner state between
+/// the aggregate's dynamic filter and the data source's predicate.
+///
+/// AggregateExec creates a dynamic filter for partial aggregates that compute
+/// MIN/MAX over a single column, enabling bounds-based pruning at the data source.
+#[test]
+fn test_aggregate_with_dynamic_filter_roundtrip() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+    let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+
+    // Create a partial min aggregate - this is the condition under which
+    // AggregateExec creates a dynamic filter.
+    let min_agg = AggregateExprBuilder::new(
+        datafusion::functions_aggregate::min_max::min_udaf(),
+        vec![Arc::clone(&col_a)],
+    )
+    .schema(Arc::clone(&schema))
+    .alias("min_a")
+    .build()
+    .map(Arc::new)?;
+
+    // AggregateExec::try_new calls init_dynamic_filter() which creates
+    // a DynamicFilterPhysicalExpr for the min(a) column.
+    let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let agg = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![]),
+        vec![min_agg],
+        vec![None],
+        child,
+        Arc::clone(&schema),
+    )?;
+
+    // Verify that the dynamic filter was created by init_dynamic_filter.
+    let dynamic_filter = agg
+        .dynamic_filter()
+        .expect("AggregateExec should have a dynamic filter for partial min");
+
+    // Simulate filter pushdown: create a FilterExec on the child with the
+    // same dynamic filter as the AggregateExec would push down.
+    let child_with_filter = Arc::new(FilterExec::try_new(
+        Arc::clone(dynamic_filter) as Arc<dyn PhysicalExpr>,
+        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+    )?) as Arc<dyn ExecutionPlan>;
+
+    // Re-create AggregateExec with the filtered child.
+    let mut agg = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![]),
+        vec![{
+            AggregateExprBuilder::new(
+                datafusion::functions_aggregate::min_max::min_udaf(),
+                vec![Arc::clone(&col_a)],
+            )
+            .schema(Arc::clone(&schema))
+            .alias("min_a")
+            .build()
+            .map(Arc::new)?
+        }],
+        vec![None],
+        child_with_filter,
+        Arc::clone(&schema),
+    )?;
+    // Set the same dynamic filter (so it shares inner state with child).
+    agg.set_dynamic_filter(Arc::clone(dynamic_filter));
+
+    let plan = Arc::new(agg) as Arc<dyn ExecutionPlan>;
+
+    // Roundtrip with deduplication.
+    // Note: We don't use roundtrip_test_and_return here because there's a
+    // pre-existing issue with PhysicalGroupBy serialization where empty groups
+    // `[[]]` become `[]` after roundtrip. This is unrelated to dynamic filters.
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let converter = DeduplicatingProtoConverter {};
+    let bytes = physical_plan_to_bytes_with_proto_converter(
+        Arc::clone(&plan),
+        &codec,
+        &converter,
+    )?;
+    let deserialized = physical_plan_from_bytes_with_proto_converter(
+        bytes.as_ref(),
+        ctx.task_ctx().as_ref(),
+        &codec,
+        &converter,
+    )?;
+
+    // Extract the deserialized AggregateExec and its dynamic filter.
+    let deserialized_agg = deserialized
+        .as_any()
+        .downcast_ref::<AggregateExec>()
+        .expect("Should be AggregateExec");
+
+    let deserialized_agg_df = deserialized_agg
+        .dynamic_filter()
+        .expect("AggregateExec should have a dynamic filter after roundtrip");
+
+    // Extract the dynamic filter from the child FilterExec.
+    let deserialized_child_filter = deserialized_agg
+        .input()
+        .as_any()
+        .downcast_ref::<FilterExec>()
+        .expect("Child should be FilterExec");
+    let deserialized_child_df = deserialized_child_filter
+        .predicate()
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Child predicate should be DynamicFilterPhysicalExpr");
+
+    // The AggregateExec's dynamic filter and the child's predicate should
+    // share the same inner state after roundtrip.
+    assert_eq!(
+        deserialized_agg_df.inner_id(),
+        deserialized_child_df.inner_id(),
+        "AggregateExec's dynamic filter should share inner state with child's predicate"
+    );
+
+    Ok(())
+}
+
+/// Test that a SortExec (TopK) with a dynamic filter pushed down to the child
+/// can be serialized and deserialized, preserving the shared inner state between
+/// the sort's dynamic filter and the data source's predicate.
+///
+/// SortExec creates a dynamic filter when it has a fetch limit (TopK optimization),
+/// allowing it to push threshold information to the data source for pruning.
+#[test]
+fn test_sort_topk_with_dynamic_filter_roundtrip() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+
+    let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::clone(&col_a),
+        options: SortOptions::default(),
+    };
+    let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
+
+    // Create a SortExec with a fetch limit (TopK) - this creates the dynamic filter.
+    let sort = SortExec::new(ordering, Arc::new(EmptyExec::new(Arc::clone(&schema))))
+        .with_fetch(Some(10));
+
+    // Verify that the dynamic filter was created.
+    let dynamic_filter = sort
+        .dynamic_filter()
+        .expect("SortExec with fetch should have a dynamic filter");
+
+    // Simulate filter pushdown: create a FilterExec on the child with the
+    // same dynamic filter.
+    let child_with_filter = Arc::new(FilterExec::try_new(
+        Arc::clone(&dynamic_filter) as Arc<dyn PhysicalExpr>,
+        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+    )?) as Arc<dyn ExecutionPlan>;
+
+    // Re-create SortExec with the filtered child and the same dynamic filter.
+    let mut sort = SortExec::new(
+        LexOrdering::new(vec![PhysicalSortExpr {
+            expr: Arc::clone(&col_a),
+            options: SortOptions::default(),
+        }])
+        .unwrap(),
+        child_with_filter,
+    )
+    .with_fetch(Some(10));
+    sort.set_dynamic_filter(dynamic_filter);
+
+    let plan = Arc::new(sort) as Arc<dyn ExecutionPlan>;
+
+    // Roundtrip with deduplication.
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let converter = DeduplicatingProtoConverter {};
+    let deserialized = roundtrip_test_and_return(plan, &ctx, &codec, &converter)?;
+
+    // Extract the deserialized SortExec and its dynamic filter.
+    let deserialized_sort = deserialized
+        .as_any()
+        .downcast_ref::<SortExec>()
+        .expect("Should be SortExec");
+
+    let deserialized_sort_df = deserialized_sort
+        .dynamic_filter()
+        .expect("SortExec should have a dynamic filter after roundtrip");
+
+    // Extract the dynamic filter from the child FilterExec.
+    let deserialized_child_filter = deserialized_sort
+        .input()
+        .as_any()
+        .downcast_ref::<FilterExec>()
+        .expect("Child should be FilterExec");
+    let deserialized_child_df = deserialized_child_filter
+        .predicate()
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Child predicate should be DynamicFilterPhysicalExpr");
+
+    // The SortExec's dynamic filter and the child's predicate should
+    // share the same inner state after roundtrip.
+    assert_eq!(
+        deserialized_sort_df.inner_id(),
+        deserialized_child_df.inner_id(),
+        "SortExec's dynamic filter should share inner state with child's predicate"
+    );
+
+    Ok(())
+}

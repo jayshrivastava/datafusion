@@ -1072,6 +1072,21 @@ impl SortExec {
         self.fetch
     }
 
+    /// Returns the dynamic filter expression for this sort (TopK), if set.
+    ///
+    /// The dynamic filter is created when `fetch` is `Some`, allowing the
+    /// TopK operator to push down threshold information to the data source.
+    pub fn dynamic_filter(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
+        self.filter.as_ref().map(|f| f.read().expr())
+    }
+
+    /// Replace the dynamic filter expression for this sort.
+    /// This is used during deserialization to link the sort's dynamic filter
+    /// with the same inner state as the child data source's filter.
+    pub fn set_dynamic_filter(&mut self, filter: Arc<DynamicFilterPhysicalExpr>) {
+        self.filter = Some(Arc::new(RwLock::new(TopKDynamicFilters::new(filter))));
+    }
+
     fn output_partitioning_helper(
         input: &Arc<dyn ExecutionPlan>,
         preserve_partitioning: bool,
