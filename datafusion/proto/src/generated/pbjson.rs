@@ -16501,6 +16501,9 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         if self.is_complete {
             len += 1;
         }
+        if self.inner_id.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalDynamicFilterNode", len)?;
         if !self.children.is_empty() {
             struct_ser.serialize_field("children", &self.children)?;
@@ -16518,6 +16521,11 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         }
         if self.is_complete {
             struct_ser.serialize_field("isComplete", &self.is_complete)?;
+        }
+        if let Some(v) = self.inner_id.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("innerId", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -16537,6 +16545,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             "innerExpr",
             "is_complete",
             "isComplete",
+            "inner_id",
+            "innerId",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16546,6 +16556,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             Generation,
             InnerExpr,
             IsComplete,
+            InnerId,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16572,6 +16583,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             "generation" => Ok(GeneratedField::Generation),
                             "innerExpr" | "inner_expr" => Ok(GeneratedField::InnerExpr),
                             "isComplete" | "is_complete" => Ok(GeneratedField::IsComplete),
+                            "innerId" | "inner_id" => Ok(GeneratedField::InnerId),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16596,6 +16608,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                 let mut generation__ = None;
                 let mut inner_expr__ = None;
                 let mut is_complete__ = None;
+                let mut inner_id__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Children => {
@@ -16630,6 +16643,14 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             }
                             is_complete__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::InnerId => {
+                            if inner_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("innerId"));
+                            }
+                            inner_id__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
                     }
                 }
                 Ok(PhysicalDynamicFilterNode {
@@ -16638,6 +16659,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                     generation: generation__.unwrap_or_default(),
                     inner_expr: inner_expr__,
                     is_complete: is_complete__.unwrap_or_default(),
+                    inner_id: inner_id__,
                 })
             }
         }
@@ -16652,25 +16674,25 @@ impl serde::Serialize for PhysicalExprNode {
     {
         use serde::ser::SerializeStruct;
         let mut len = 0;
-        if self.expr_id.is_some() {
+        if self.external_expr_id.is_some() {
             len += 1;
         }
-        if self.dynamic_filter_inner_id.is_some() {
+        if self.internal_expr_id.is_some() {
             len += 1;
         }
         if self.expr_type.is_some() {
             len += 1;
         }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalExprNode", len)?;
-        if let Some(v) = self.expr_id.as_ref() {
+        if let Some(v) = self.external_expr_id.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("exprId", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("externalExprId", ToString::to_string(&v).as_str())?;
         }
-        if let Some(v) = self.dynamic_filter_inner_id.as_ref() {
+        if let Some(v) = self.internal_expr_id.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("dynamicFilterInnerId", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("internalExprId", ToString::to_string(&v).as_str())?;
         }
         if let Some(v) = self.expr_type.as_ref() {
             match v {
@@ -16746,10 +16768,10 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
         D: serde::Deserializer<'de>,
     {
         const FIELDS: &[&str] = &[
-            "expr_id",
-            "exprId",
-            "dynamic_filter_inner_id",
-            "dynamicFilterInnerId",
+            "external_expr_id",
+            "externalExprId",
+            "internal_expr_id",
+            "internalExprId",
             "column",
             "literal",
             "binary_expr",
@@ -16788,8 +16810,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
-            ExprId,
-            DynamicFilterInnerId,
+            ExternalExprId,
+            InternalExprId,
             Column,
             Literal,
             BinaryExpr,
@@ -16831,8 +16853,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                         E: serde::de::Error,
                     {
                         match value {
-                            "exprId" | "expr_id" => Ok(GeneratedField::ExprId),
-                            "dynamicFilterInnerId" | "dynamic_filter_inner_id" => Ok(GeneratedField::DynamicFilterInnerId),
+                            "externalExprId" | "external_expr_id" => Ok(GeneratedField::ExternalExprId),
+                            "internalExprId" | "internal_expr_id" => Ok(GeneratedField::InternalExprId),
                             "column" => Ok(GeneratedField::Column),
                             "literal" => Ok(GeneratedField::Literal),
                             "binaryExpr" | "binary_expr" => Ok(GeneratedField::BinaryExpr),
@@ -16872,24 +16894,24 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                 where
                     V: serde::de::MapAccess<'de>,
             {
-                let mut expr_id__ = None;
-                let mut dynamic_filter_inner_id__ = None;
+                let mut external_expr_id__ = None;
+                let mut internal_expr_id__ = None;
                 let mut expr_type__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
-                        GeneratedField::ExprId => {
-                            if expr_id__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("exprId"));
+                        GeneratedField::ExternalExprId => {
+                            if external_expr_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("externalExprId"));
                             }
-                            expr_id__ = 
+                            external_expr_id__ = 
                                 map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
                             ;
                         }
-                        GeneratedField::DynamicFilterInnerId => {
-                            if dynamic_filter_inner_id__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("dynamicFilterInnerId"));
+                        GeneratedField::InternalExprId => {
+                            if internal_expr_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("internalExprId"));
                             }
-                            dynamic_filter_inner_id__ = 
+                            internal_expr_id__ = 
                                 map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
                             ;
                         }
@@ -17036,8 +17058,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                     }
                 }
                 Ok(PhysicalExprNode {
-                    expr_id: expr_id__,
-                    dynamic_filter_inner_id: dynamic_filter_inner_id__,
+                    external_expr_id: external_expr_id__,
+                    internal_expr_id: internal_expr_id__,
                     expr_type: expr_type__,
                 })
             }

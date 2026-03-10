@@ -2852,8 +2852,8 @@ fn test_backward_compatibility_no_expr_id() -> Result<()> {
 
     // Manually create a proto without expr_id set
     let proto = PhysicalExprNode {
-        expr_id: None, // Simulating old proto without this field
-        dynamic_filter_inner_id: None,
+        external_expr_id: None, // Simulating old proto without this field
+        internal_expr_id: None, // Simulating old proto without this field
         expr_type: Some(
             datafusion_proto::protobuf::physical_expr_node::ExprType::Column(
                 datafusion_proto::protobuf::PhysicalColumn {
@@ -3180,18 +3180,11 @@ fn dynamic_filter_outer_inner_equal(
     filter_expr_1: &Arc<dyn PhysicalExpr>,
     filter_expr_2: &Arc<dyn PhysicalExpr>,
 ) -> (bool, bool) {
+    let (simple_id_1, complex_id_1) = Arc::clone(filter_expr_1).expr_id(&[]);
+    let (simple_id_2, complex_id_2) = Arc::clone(filter_expr_2).expr_id(&[]);
     (
-        std::ptr::addr_eq(Arc::as_ptr(filter_expr_1), Arc::as_ptr(filter_expr_2)),
-        filter_expr_1
-            .as_any()
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .unwrap()
-            .inner_id()
-            == filter_expr_2
-                .as_any()
-                .downcast_ref::<DynamicFilterPhysicalExpr>()
-                .unwrap()
-                .inner_id(),
+        simple_id_1.unwrap() == simple_id_2.unwrap(),
+        complex_id_1.unwrap() == complex_id_2.unwrap(),
     )
 }
 
@@ -3241,29 +3234,28 @@ fn test_deduplication_of_dynamic_filter_expression(
         .as_ref()
         .expect("Should have filter expression");
 
-    // Both should have dynamic_filter_inner_id set
-    let filter1_dynamic_id = filter1_proto
-        .dynamic_filter_inner_id
-        .expect("Filter1 should have dynamic_filter_inner_id");
-    let filter2_dynamic_id = filter2_proto
-        .dynamic_filter_inner_id
-        .expect("Filter2 should have dynamic_filter_inner_id");
-
+    // Both should have inner_id set on the DynamicFilter node
+    let filter1_complex_id = &filter1_proto
+        .internal_expr_id
+        .expect("filter1 should have a complex expr id");
+    let filter2_complex_id = &filter2_proto
+        .internal_expr_id
+        .expect("filter2 should have a complex expr id");
     assert_eq!(
         inner_equal,
-        filter1_dynamic_id == filter2_dynamic_id,
-        "Dynamic filters sharing the same inner state should have the same dynamic_filter_inner_id"
+        filter1_complex_id == filter2_complex_id,
+        "Dynamic filters sharing the same inner state should have the same complex id"
     );
 
-    let filter1_expr_id = filter1_proto.expr_id.expect("Should have expr_id");
-    let filter2_expr_id = filter2_proto.expr_id.expect("Should have expr_id");
+    let filter1_expr_id = filter1_proto.external_expr_id.expect("Should have expr_id");
+    let filter2_expr_id = filter2_proto.external_expr_id.expect("Should have expr_id");
     assert_eq!(
         outer_equal,
         filter1_expr_id == filter2_expr_id,
         "Different filters have different expr ids"
     );
 
-    // Test deserialization - verify that filters with same dynamic_filter_inner_id share state
+    // Test deserialization - verify that filters with same inner_id share state
     let ctx = SessionContext::new();
     let deserialized_plan =
         converter.proto_to_execution_plan(ctx.task_ctx().as_ref(), &codec, &proto)?;
@@ -3288,23 +3280,12 @@ fn test_deduplication_of_dynamic_filter_expression(
         "Deserialized filters should be different Arcs"
     );
 
-    // Check if they're DynamicFilterPhysicalExpr (they might be snapshotted to Literal)
-    let (df1, df2) = match (
-        filter1_deserialized
-            .as_any()
-            .downcast_ref::<DynamicFilterPhysicalExpr>(),
-        filter2_deserialized
-            .as_any()
-            .downcast_ref::<DynamicFilterPhysicalExpr>(),
-    ) {
-        (Some(df1), Some(df2)) => (df1, df2),
-        _ => panic!("Should be DynamicFilterPhysicalExpr"),
-    };
-
-    // But they should have the same inner_id (shared inner state)
+    // They should have the same inner_id (shared inner state)
+    let df1_complex_id = Arc::clone(filter1_deserialized).expr_id(&[]).1.unwrap();
+    let df2_complex_id = Arc::clone(filter2_deserialized).expr_id(&[]).1.unwrap();
     assert_eq!(
         inner_equal,
-        df1.inner_id() == df2.inner_id(),
+        df1_complex_id == df2_complex_id,
         "Deserialized filters should share inner state"
     );
 
@@ -3317,6 +3298,18 @@ fn test_deduplication_of_dynamic_filter_expression(
         .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .unwrap();
+
+    let (df1, df2) = match (
+        filter1_deserialized
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>(),
+        filter2_deserialized
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>(),
+    ) {
+        (Some(df1), Some(df2)) => (df1, df2),
+        _ => panic!("Should be DynamicFilterPhysicalExpr"),
+    };
 
     assert_eq!(
         DynamicFilterSnapshot::from(filter_1_before_roundtrip).to_string(),
@@ -3346,13 +3339,13 @@ fn test_session_id_rotation_between_serializations() -> Result<()> {
 
     // First serialization
     let proto1 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id1 = proto1.expr_id.expect("Expected expr_id to be set");
+    let expr_id1 = proto1.external_expr_id.expect("Expected expr_id to be set");
 
     // Second serialization with the same converter
     // The session_id should have rotated, so the expr_id should be different
     // even though we're serializing the same expression (same pointer address)
     let proto2 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id2 = proto2.expr_id.expect("Expected expr_id to be set");
+    let expr_id2 = proto2.external_expr_id.expect("Expected expr_id to be set");
 
     // The expr_ids should be different because session_id rotated
     assert_ne!(

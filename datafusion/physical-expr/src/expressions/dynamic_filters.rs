@@ -26,7 +26,9 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr_common::physical_expr::DynHash;
+use datafusion_physical_expr_common::physical_expr::{
+    DynHash, ExternalPhysicalExprId, InternalPhysicalExprId, expr_id_from_arc,
+};
 
 /// State of a dynamic filter, tracking both updates and completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,39 +293,6 @@ impl DynamicFilterPhysicalExpr {
         }
     }
 
-    /// Create a new [`DynamicFilterPhysicalExpr`] from `self`, except it overwrites the
-    /// internal state with the source filter's state.
-    ///
-    /// This is a low-level API intended for use by the proto deserialization layer.
-    ///
-    /// # Safety
-    ///
-    /// The dynamic filter should not be in use when calling this method, otherwise there
-    /// may be undefined behavior. Changing the inner state of a filter may do the following:
-    /// - transition the state to complete without notifying the watch
-    /// - cause a generation number to be emitted which is out of order
-    pub fn new_from_source(
-        self: &Arc<Self>,
-        source: &DynamicFilterPhysicalExpr,
-    ) -> Result<Self> {
-        // If there's any references to this filter or any watchers, we should not replace the
-        // inner state.
-        if self.is_used() {
-            return internal_err!(
-                "Cannot replace the inner state of a DynamicFilterPhysicalExpr that is in use"
-            );
-        };
-
-        Ok(Self {
-            children: self.children.clone(),
-            remapped_children: self.remapped_children.clone(),
-            inner: Arc::clone(&source.inner),
-            state_watch: self.state_watch.clone(),
-            data_type: Arc::clone(&self.data_type),
-            nullable: Arc::clone(&self.nullable),
-        })
-    }
-
     fn remap_children(
         &self,
         expr: Arc<dyn PhysicalExpr>,
@@ -468,14 +437,6 @@ impl DynamicFilterPhysicalExpr {
         Arc::strong_count(self) > 1 || Arc::strong_count(&self.inner) > 1
     }
 
-    /// Returns a unique identifier for the inner shared state.
-    ///
-    /// Useful for checking if two [`Arc<PhysicalExpr>`] with the same
-    /// underlying [`DynamicFilterPhysicalExpr`] are the same.
-    pub fn inner_id(&self) -> u64 {
-        Arc::as_ptr(&self.inner) as *const () as u64
-    }
-
     fn render(
         &self,
         f: &mut std::fmt::Formatter<'_>,
@@ -596,6 +557,49 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
     fn snapshot_generation(&self) -> u64 {
         // Return the current generation of the expression.
         self.inner.read().generation
+    }
+
+    fn expr_id(
+        self: Arc<Self>,
+        salt: &[u64],
+    ) -> (
+        Option<ExternalPhysicalExprId>,
+        Option<InternalPhysicalExprId>,
+    ) {
+        (
+            Some(expr_id_from_arc(&self, salt)),
+            Some(expr_id_from_arc(&self.inner, salt)),
+        )
+    }
+
+    fn link_expr(
+        self: Arc<Self>,
+        other: Arc<dyn PhysicalExpr>,
+        _expr_id: InternalPhysicalExprId,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // If there's any references to this filter or any watchers, we should not replace the
+        // inner state.
+        if self.is_used() {
+            return internal_err!(
+                "Cannot replace the inner state of a DynamicFilterPhysicalExpr that is in use"
+            );
+        };
+
+        let Some(other) = other.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+        else {
+            return internal_err!(
+                "Cannot link DynamicFilterPhysicalExpr with an expression that is not DynamicFilterPhysicalExpr"
+            );
+        };
+
+        Ok(Arc::new(Self {
+            children: self.children.clone(),
+            remapped_children: self.remapped_children.clone(),
+            inner: Arc::clone(&other.inner),
+            state_watch: other.state_watch.clone(),
+            data_type: Arc::clone(&self.data_type),
+            nullable: Arc::clone(&self.nullable),
+        }))
     }
 }
 
@@ -1050,17 +1054,13 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_new_from_source() {
+    #[tokio::test]
+    async fn test_link_expr() {
         // Create a source filter
         let source = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![],
             lit(42) as Arc<dyn PhysicalExpr>,
         ));
-
-        // Update and mark complete
-        source.update(lit(100) as Arc<dyn PhysicalExpr>).unwrap();
-        source.mark_complete();
 
         // Create a target filter with different children
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -1070,34 +1070,65 @@ mod test {
             lit(0) as Arc<dyn PhysicalExpr>,
         ));
 
-        // Create new filter from source's inner state
-        let combined = target.new_from_source(&source).unwrap();
+        // Link source to target.
+        let combined = target
+            .link_expr(Arc::clone(&source) as Arc<dyn PhysicalExpr>, 0)
+            .unwrap();
 
-        // Verify inner state is shared (same inner_id)
+        // Verify inner state is shared (same internal id)
+        let combined_internal_id = Arc::clone(&combined).expr_id(&[]).1.unwrap();
+        let source_internal_id = Arc::clone(&combined).expr_id(&[]).1.unwrap();
         assert_eq!(
-            combined.inner_id(),
-            source.inner_id(),
-            "new_from_source should share inner state with source"
+            combined_internal_id, source_internal_id,
+            "dynamic filters with shared inner state should have the same internal id"
         );
 
-        // Verify children are from target, not source
-        let combined_snapshot = DynamicFilterSnapshot::from(&combined);
+        let combined_dyn_filter = combined
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap();
+
+        // Verify the children are unchanged.
         assert_eq!(
-            combined_snapshot.children().len(),
-            1,
-            "Combined filter should have target's children"
-        );
-        assert_eq!(
-            format!("{:?}", combined_snapshot.children()[0]),
-            format!("{:?}", col_x),
-            "Combined filter should have target's children"
+            format!("{:?}", combined.children()),
+            format!("{:?}", vec![col_x]),
+            "Combined filter's children should be unchanged"
         );
 
-        // Verify inner expression comes from source
+        // Verify inner expression changed to the one from source.
         assert_eq!(
-            format!("{:?}", combined_snapshot.inner_expr()),
-            format!("{:?}", lit(100)),
-            "Combined filter should have source's inner expression"
+            format!("{:?}", combined_dyn_filter.current().unwrap()),
+            format!("{:?}", lit(42)),
+            "Combined filter should have inner expression from linked filter"
+        );
+
+        // Verify that completing one filter also completes the other.
+        let combined_binding = Arc::clone(&combined) as Arc<dyn PhysicalExpr>;
+        let wait_handle = tokio::spawn({
+            async move {
+                let df = combined_binding
+                    .as_any()
+                    .downcast_ref::<DynamicFilterPhysicalExpr>()
+                    .unwrap();
+                df.wait_complete().await;
+                format!("{:?}", df.current().unwrap())
+            }
+        });
+        source.update(lit(999) as Arc<dyn PhysicalExpr>).unwrap();
+        source.mark_complete();
+
+        // The linked filter should be notified via the shared watch
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_handle)
+            .await
+            .expect(
+                "linked filter should have been notified of completion within timeout",
+            )
+            .expect("task should not panic");
+
+        assert_eq!(
+            result,
+            format!("{:?}", lit(999)),
+            "linked filter should see source's updated inner expression"
         );
     }
 }

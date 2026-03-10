@@ -1307,20 +1307,21 @@ pub struct PhysicalExtensionNode {
 /// physical expressions
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalExprNode {
-    /// Unique identifier for this expression to do deduplication during deserialization.
+    /// Simple unique identifier for this expression to do deduplication during deserialization.
     /// When serializing, this is set to a unique identifier for each combination of
     /// expression, process and serialization run.
     /// When deserializing, if this ID has been seen before, the cached Arc is returned
     /// instead of creating a new one, enabling reconstruction of referential integrity
     /// across serde roundtrips.
+    /// Two expressions with the same external_expr_id are equivalent and interchangeable.
     #[prost(uint64, optional, tag = "30")]
-    pub expr_id: ::core::option::Option<u64>,
-    /// For DynamicFilterPhysicalExpr, this identifies the shared inner state.
-    /// Multiple expressions may have different expr_id values (different outer Arc wrappers)
-    /// but the same dynamic_filter_inner_id (shared inner state).
-    /// Used to reconstruct shared inner state during deserialization.
+    pub external_expr_id: ::core::option::Option<u64>,
+    /// Complex unique identifier for this expression.
+    /// Two expressions with the same internal_expr_id are not equivalent and
+    /// interchangeable, but are related in some way. PhysicalExpr::link_expr is used
+    /// to create this relationship between expressions.
     #[prost(uint64, optional, tag = "31")]
-    pub dynamic_filter_inner_id: ::core::option::Option<u64>,
+    pub internal_expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
         tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22"
@@ -1392,6 +1393,12 @@ pub struct PhysicalDynamicFilterNode {
     pub inner_expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(bool, tag = "5")]
     pub is_complete: bool,
+    /// Identifies the shared inner state for DynamicFilterPhysicalExpr.
+    /// Multiple expressions may have different expr_id values (different outer Arc wrappers)
+    /// but the same inner_id (shared inner state).
+    /// Used to reconstruct shared inner state during deserialization.
+    #[prost(uint64, optional, tag = "6")]
+    pub inner_id: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalScalarUdfNode {

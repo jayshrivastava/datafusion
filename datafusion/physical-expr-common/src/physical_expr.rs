@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Display, Formatter};
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use crate::utils::scatter;
@@ -441,7 +441,63 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::KeepInPlace
     }
+
+    /// Returns a unique identifiers for this expression. Ids are globally unique within a process.
+    ///
+    /// Takes an salts to deterministically modify the ids. For examplle, a user may
+    /// want expr ids to be distinct across queries, so passing a
+    ///
+    /// See [`ExternalPhysicalExpressionId`] or more details.
+    fn expr_id(
+        self: Arc<Self>,
+        salt: &[u64],
+    ) -> (
+        Option<ExternalPhysicalExprId>,
+        Option<InternalPhysicalExprId>,
+    ) {
+        (Some(expr_id_from_arc(&self, salt)), None)
+    }
+
+    fn link_expr(
+        self: Arc<Self>,
+        other: Arc<dyn PhysicalExpr>,
+        _expr_id: InternalPhysicalExprId,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(other)
+    }
 }
+
+/// Compute a unique hash-based ID from an `Arc<dyn PhysicalExpr>` pointer.
+/// This hashes the Arc's pointer address and the process ID to produce
+/// a value suitable for use as either a [`ExternalPhysicalExpressionId`]
+/// or a [`InternalPhysicalExpressionId`].
+pub fn expr_id_from_arc<T: ?Sized>(expr: &Arc<T>, salt: &[u64]) -> u64 {
+    // Hash pointer address and process ID together to create expr_id.
+    // - ptr: unique address per Arc within a process
+    // - pid: prevents collisions if serializer is shared across processes
+    let mut hasher = DefaultHasher::new();
+    let ptr = Arc::as_ptr(expr) as *const () as u64;
+    ptr.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+
+    for &salt in salt {
+        salt.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A unique identifier for a physical expression.
+///
+/// If two expressions have the same External identifier, then they are
+/// equivalent and interchangeable.
+pub type ExternalPhysicalExprId = u64;
+
+/// A unique identifier for a physical expression.
+///
+/// If two expressions have the same Internal identifier, then they are not equivalent and
+/// interchangeable, but are related in some way. [`PhysicalExpr::link_expr`] allows exprs to
+/// define how they want to be linked together.
+pub type InternalPhysicalExprId = u64;
 
 #[deprecated(
     since = "50.0.0",
