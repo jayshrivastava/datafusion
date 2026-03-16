@@ -2757,7 +2757,6 @@ fn test_backward_compatibility_no_expr_id() -> Result<()> {
     // Manually create a proto without expr_id set
     let proto = PhysicalExprNode {
         expr_id: None, // Simulating old proto without this field
-        dynamic_filter_inner_id: None,
         expr_type: Some(
             datafusion_proto::protobuf::physical_expr_node::ExprType::Column(
                 datafusion_proto::protobuf::PhysicalColumn {
@@ -3145,20 +3144,6 @@ fn test_deduplication_of_dynamic_filter_expression(
         .as_ref()
         .expect("Should have filter expression");
 
-    // Both should have dynamic_filter_inner_id set
-    let filter1_dynamic_id = filter1_proto
-        .dynamic_filter_inner_id
-        .expect("Filter1 should have dynamic_filter_inner_id");
-    let filter2_dynamic_id = filter2_proto
-        .dynamic_filter_inner_id
-        .expect("Filter2 should have dynamic_filter_inner_id");
-
-    assert_eq!(
-        inner_equal,
-        filter1_dynamic_id == filter2_dynamic_id,
-        "Dynamic filters sharing the same inner state should have the same dynamic_filter_inner_id"
-    );
-
     let filter1_expr_id = filter1_proto.expr_id.expect("Should have expr_id");
     let filter2_expr_id = filter2_proto.expr_id.expect("Should have expr_id");
     assert_eq!(
@@ -3234,109 +3219,3 @@ fn test_deduplication_of_dynamic_filter_expression(
     Ok(())
 }
 
-/// Test that session_id rotates between top-level serialization operations.
-/// This verifies that each top-level serialization gets a fresh session_id,
-/// which prevents cross-process collisions when serialized plans are merged.
-#[test]
-fn test_session_id_rotation_between_serializations() -> Result<()> {
-    let field_a = Field::new("a", DataType::Int64, false);
-    let _schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a simple expression
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // First serialization
-    let proto1 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id1 = proto1.expr_id.expect("Expected expr_id to be set");
-
-    // Second serialization with the same converter
-    // The session_id should have rotated, so the expr_id should be different
-    // even though we're serializing the same expression (same pointer address)
-    let proto2 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id2 = proto2.expr_id.expect("Expected expr_id to be set");
-
-    // The expr_ids should be different because session_id rotated
-    assert_ne!(
-        expr_id1, expr_id2,
-        "Expected different expr_ids due to session_id rotation between serializations"
-    );
-
-    // Also test that serializing the same expression multiple times within
-    // the same top-level operation would give the same expr_id (not testable
-    // here directly since each physical_expr_to_proto is a top-level operation,
-    // but the deduplication tests verify this indirectly)
-
-    Ok(())
-}
-
-/// Test that session_id rotation works correctly with execution plans.
-/// This verifies the end-to-end behavior with plan serialization.
-#[test]
-fn test_session_id_rotation_with_execution_plans() -> Result<()> {
-    use datafusion_proto::bytes::physical_plan_to_bytes_with_proto_converter;
-
-    let field_a = Field::new("a", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a simple plan
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let projection_exprs = vec![ProjectionExpr {
-        expr: Arc::clone(&col_expr),
-        alias: "a1".to_string(),
-    }];
-    let exec_plan = Arc::new(ProjectionExec::try_new(
-        projection_exprs.clone(),
-        Arc::new(EmptyExec::new(Arc::clone(&schema))),
-    )?);
-
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // First serialization
-    let bytes1 = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
-        &codec,
-        &proto_converter,
-    )?;
-
-    // Second serialization with the same converter
-    let bytes2 = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
-        &codec,
-        &proto_converter,
-    )?;
-
-    // The serialized bytes should be different due to different session_ids
-    // (specifically, the expr_id values embedded in the protobuf will differ)
-    assert_ne!(
-        bytes1.as_ref(),
-        bytes2.as_ref(),
-        "Expected different serialized bytes due to session_id rotation"
-    );
-
-    // But both should deserialize correctly
-    let ctx = SessionContext::new();
-    let deser_converter = DeduplicatingProtoConverter {};
-
-    let plan1 = datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter(
-        bytes1.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &deser_converter,
-    )?;
-
-    let plan2 = datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter(
-        bytes2.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &deser_converter,
-    )?;
-
-    // Verify both plans have the expected structure
-    assert_eq!(plan1.schema(), plan2.schema());
-
-    Ok(())
-}
