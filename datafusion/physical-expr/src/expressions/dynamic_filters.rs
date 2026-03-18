@@ -27,7 +27,7 @@ use datafusion_common::{
 };
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::physical_expr::{
-    DynHash, ExternalPhysicalExprId, expr_id_from_arc,
+    DedupSnapshot, DedupablePhysicalExpr, DynHash, expr_id_from_arc,
 };
 
 /// State of a dynamic filter, tracking both updates and completion.
@@ -101,7 +101,7 @@ pub struct DynamicFilterSnapshot {
     is_complete: bool,
     /// The internal expression id, computed atomically from the generation and inner pointer.
     /// This is used to link dynamic filters that share the same inner state during deduplication.
-    inner_id: Option<u64>,
+    internal_expr_id: Option<u64>,
 }
 
 impl DynamicFilterSnapshot {
@@ -118,7 +118,7 @@ impl DynamicFilterSnapshot {
             generation,
             inner_expr,
             is_complete,
-            inner_id: None,
+            internal_expr_id: None,
         }
     }
 
@@ -142,8 +142,11 @@ impl DynamicFilterSnapshot {
         self.is_complete
     }
 
-    pub fn inner_id(&self) -> Option<u64> {
-        self.inner_id
+}
+
+impl DedupSnapshot for DynamicFilterSnapshot {
+    fn internal_expr_id(&self) -> Option<u64> {
+        self.internal_expr_id
     }
 }
 
@@ -169,7 +172,7 @@ impl From<DynamicFilterSnapshot> for DynamicFilterPhysicalExpr {
             generation,
             inner_expr,
             is_complete,
-            inner_id: _,
+            internal_expr_id: _,
         } = snapshot;
 
         let state = if is_complete {
@@ -196,14 +199,14 @@ impl From<DynamicFilterSnapshot> for DynamicFilterPhysicalExpr {
 
 impl From<&DynamicFilterPhysicalExpr> for DynamicFilterSnapshot {
     fn from(expr: &DynamicFilterPhysicalExpr) -> Self {
-        let (generation, inner_expr, is_complete, inner_id) = {
+        let (generation, inner_expr, is_complete, internal_expr_id) = {
             let inner = expr.inner.read();
-            let inner_id = expr_id_from_arc(&expr.inner, &[inner.generation]);
+            let internal_expr_id = expr_id_from_arc(&expr.inner, &[inner.generation]);
             (
                 inner.generation,
                 Arc::clone(&inner.expr),
                 inner.is_complete,
-                inner_id,
+                internal_expr_id,
             )
         };
         DynamicFilterSnapshot {
@@ -212,7 +215,7 @@ impl From<&DynamicFilterPhysicalExpr> for DynamicFilterSnapshot {
             generation,
             inner_expr,
             is_complete,
-            inner_id: Some(inner_id),
+            internal_expr_id: Some(internal_expr_id),
         }
     }
 }
@@ -575,23 +578,29 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         self.inner.read().generation
     }
 
-    fn expr_id(self: Arc<Self>) -> Option<ExternalPhysicalExprId> {
-        Some(expr_id_from_arc(&self, &[]))
+    fn as_dedupable(&self) -> Option<&dyn DedupablePhysicalExpr> {
+        Some(self)
+    }
+}
+
+impl DedupablePhysicalExpr for DynamicFilterPhysicalExpr {
+    fn dedup_snapshot(&self) -> Result<Box<dyn DedupSnapshot>> {
+        Ok(Box::new(DynamicFilterSnapshot::from(self)))
     }
 
     fn link_expr(
-        self: Arc<Self>,
-        other: Arc<dyn PhysicalExpr>,
+        &self,
+        donor: &dyn PhysicalExpr,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        // If there's any references to this filter or any watchers, we should not replace the
-        // inner state.
-        if self.is_used() {
+        // If there are watchers on the state channel, the filter is in active use
+        // and we should not replace its inner state.
+        if self.state_watch.receiver_count() > 0 {
             return internal_err!(
                 "Cannot replace the inner state of a DynamicFilterPhysicalExpr that is in use"
             );
         };
 
-        let Some(other) = other.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+        let Some(other) = donor.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
         else {
             return internal_err!(
                 "Cannot link DynamicFilterPhysicalExpr with an expression that is not DynamicFilterPhysicalExpr"
@@ -1076,12 +1085,10 @@ mod test {
             lit(0) as Arc<dyn PhysicalExpr>,
         ));
 
-        // Link source to target.
-        let combined = target
-            .link_expr(Arc::clone(&source) as Arc<dyn PhysicalExpr>)
-            .unwrap();
+        // Link source to target via link_expr.
+        let combined = target.link_expr(source.as_ref()).unwrap();
 
-        // Verify inner state is shared via snapshot inner_id
+        // Verify inner state is shared via snapshot internal_expr_id
         let combined_df = combined
             .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
@@ -1090,11 +1097,11 @@ mod test {
             .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap();
-        let combined_inner_id =
-            DynamicFilterSnapshot::from(combined_df).inner_id().unwrap();
-        let source_inner_id = DynamicFilterSnapshot::from(source_df).inner_id().unwrap();
+        let combined_internal_expr_id =
+            DynamicFilterSnapshot::from(combined_df).internal_expr_id().unwrap();
+        let source_internal_expr_id = DynamicFilterSnapshot::from(source_df).internal_expr_id().unwrap();
         assert_eq!(
-            combined_inner_id, source_inner_id,
+            combined_internal_expr_id, source_internal_expr_id,
             "dynamic filters with shared inner state should have the same internal id"
         );
 

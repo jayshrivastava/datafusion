@@ -442,53 +442,66 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         ExpressionPlacement::KeepInPlace
     }
 
-    /// Returns a unique identifier for this expression. Ids are globally unique within a process.
+    /// Returns a unique identifier for this expression. Ids are globally unique within
+    /// a process.
     ///
-    /// See [`ExternalPhysicalExprId`] for more details.
-    fn expr_id(self: Arc<Self>) -> Option<ExternalPhysicalExprId> {
+    /// If two expressions have the same identifier, then they are equivalent and
+    /// interchangeable: in a given query plan, if one [`PhysicalExpr`] is used in place
+    /// of another with the same identifier, then the query plan is equivalent.
+    fn expr_id(self: Arc<Self>) -> Option<u64> {
         Some(expr_id_from_arc(&self, &[]))
     }
 
-    fn link_expr(
-        self: Arc<Self>,
-        other: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(other)
+    /// Returns this expression as a [`DedupablePhysicalExpr`] if it supports
+    /// dedup-aware serialization with shared mutable state.
+    fn as_dedupable(&self) -> Option<&dyn DedupablePhysicalExpr> {
+        None
     }
 }
 
-/// Compute a unique hash-based ID from an `Arc` pointer.
-/// This hashes the Arc's pointer address, process ID, and optional salt values.
+/// Snapshot of a dynamic expression's state for dedup-aware serialization and 
+/// deserialization.
+pub trait DedupSnapshot: Send + Sync {
+    /// Returns an identifier. Two snapshots of a [`DedupablePhysicalExpr`] with
+    /// the same `internal_expr_id` will be reconnected after deserialization using
+    /// [`DedupablePhysicalExpr::link_expr`].
+    fn internal_expr_id(&self) -> Option<u64>;
+}
+
+/// A [`PhysicalExpr`] that participates in dedup-aware serialization/deserialization.
+pub trait DedupablePhysicalExpr: PhysicalExpr {
+    /// Atomically capture the state of this expression for serialization.
+    fn dedup_snapshot(&self) -> Result<Box<dyn DedupSnapshot>>;
+
+    /// Returns a new expression that links `self` to the `donor`. The behavior
+    /// of "linking" is up to the [`PhysicalExpr`] implementor.
+    fn link_expr(
+        &self,
+        donor: &dyn PhysicalExpr,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+}
+
+/// Computes a unique identifier for a type contained within an [`Arc`]. It hashes
+/// the arc pointer create a unique identifier within a process.
 pub fn expr_id_from_arc<T: ?Sized>(expr: &Arc<T>, salt: &[u64]) -> u64 {
-    // Hash pointer address and process ID together to create expr_id.
-    // - ptr: unique address per Arc within a process
-    // - pid: prevents collisions if serializer is shared across processes
     let mut hasher = DefaultHasher::new();
     let ptr = Arc::as_ptr(expr) as *const () as u64;
     ptr.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-
     for &salt in salt {
         salt.hash(&mut hasher);
     }
     hasher.finish()
 }
 
-/// Re-hash an existing expr id with a salt to produce a new unique id.
-/// This is used by serializers that need to add a session-specific salt
-/// to prevent cross-process collisions.
-pub fn salted_expr_id(id: u64, salt: u64) -> u64 {
+/// Re-hashes an existing expr id with a salt to produce a new unique id.
+pub fn salted_expr_id(id: u64, salt: &[u64]) -> u64 {
     let mut hasher = DefaultHasher::new();
     id.hash(&mut hasher);
-    salt.hash(&mut hasher);
+    for &s in salt {
+        s.hash(&mut hasher);
+    }
     hasher.finish()
 }
-
-/// A unique identifier for a physical expression.
-///
-/// If two expressions have the same External identifier, then they are
-/// equivalent and interchangeable.
-pub type ExternalPhysicalExprId = u64;
 
 #[deprecated(
     since = "50.0.0",

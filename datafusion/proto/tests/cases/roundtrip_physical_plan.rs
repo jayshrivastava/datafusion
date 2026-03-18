@@ -135,6 +135,7 @@ use datafusion_physical_expr::expressions::{
     DynamicFilterPhysicalExpr, DynamicFilterSnapshot,
 };
 use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr_common::physical_expr::DedupSnapshot;
 
 /// Perform a serde roundtrip and assert that the string representation of the before and after plans
 /// are identical. Note that this often isn't sufficient to guarantee that no information is
@@ -3188,14 +3189,14 @@ fn dynamic_filter_outer_inner_equal(
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap(),
     )
-    .inner_id();
+    .internal_expr_id();
     let complex_id_2 = DynamicFilterSnapshot::from(
         filter_expr_2
             .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap(),
     )
-    .inner_id();
+    .internal_expr_id();
     (
         simple_id_1.unwrap() == simple_id_2.unwrap(),
         complex_id_1.unwrap() == complex_id_2.unwrap(),
@@ -3248,7 +3249,7 @@ fn test_deduplication_of_dynamic_filter_expression(
         .as_ref()
         .expect("Should have filter expression");
 
-    // Both should have inner_id set on the DynamicFilter node
+    // Both should have internal_expr_id set on the DynamicFilter node
     let filter1_complex_id = &filter1_proto
         .internal_expr_id
         .expect("filter1 should have a complex expr id");
@@ -3269,7 +3270,7 @@ fn test_deduplication_of_dynamic_filter_expression(
         "Different filters have different expr ids"
     );
 
-    // Test deserialization - verify that filters with same inner_id share state
+    // Test deserialization - verify that filters with same internal_expr_id share state
     let ctx = SessionContext::new();
     let deserialized_plan =
         converter.proto_to_execution_plan(ctx.task_ctx().as_ref(), &codec, &proto)?;
@@ -3294,14 +3295,14 @@ fn test_deduplication_of_dynamic_filter_expression(
         "Deserialized filters should be different Arcs"
     );
 
-    // They should have the same inner_id (shared inner state)
+    // They should have the same internal_expr_id (shared inner state)
     let df1_complex_id = DynamicFilterSnapshot::from(
         filter1_deserialized
             .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap(),
     )
-    .inner_id()
+    .internal_expr_id()
     .unwrap();
     let df2_complex_id = DynamicFilterSnapshot::from(
         filter2_deserialized
@@ -3309,7 +3310,7 @@ fn test_deduplication_of_dynamic_filter_expression(
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap(),
     )
-    .inner_id()
+    .internal_expr_id()
     .unwrap();
     assert_eq!(
         inner_equal,
