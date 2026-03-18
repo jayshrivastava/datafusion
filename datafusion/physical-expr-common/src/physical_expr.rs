@@ -442,35 +442,23 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         ExpressionPlacement::KeepInPlace
     }
 
-    /// Returns a unique identifiers for this expression. Ids are globally unique within a process.
+    /// Returns a unique identifier for this expression. Ids are globally unique within a process.
     ///
-    /// Takes an salts to deterministically modify the ids. For examplle, a user may
-    /// want expr ids to be distinct across queries, so passing a
-    ///
-    /// See [`ExternalPhysicalExpressionId`] or more details.
-    fn expr_id(
-        self: Arc<Self>,
-        salt: &[u64],
-    ) -> (
-        Option<ExternalPhysicalExprId>,
-        Option<InternalPhysicalExprId>,
-    ) {
-        (Some(expr_id_from_arc(&self, salt)), None)
+    /// See [`ExternalPhysicalExprId`] for more details.
+    fn expr_id(self: Arc<Self>) -> Option<ExternalPhysicalExprId> {
+        Some(expr_id_from_arc(&self, &[]))
     }
 
     fn link_expr(
         self: Arc<Self>,
         other: Arc<dyn PhysicalExpr>,
-        _expr_id: InternalPhysicalExprId,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         Ok(other)
     }
 }
 
-/// Compute a unique hash-based ID from an `Arc<dyn PhysicalExpr>` pointer.
-/// This hashes the Arc's pointer address and the process ID to produce
-/// a value suitable for use as either a [`ExternalPhysicalExpressionId`]
-/// or a [`InternalPhysicalExpressionId`].
+/// Compute a unique hash-based ID from an `Arc` pointer.
+/// This hashes the Arc's pointer address, process ID, and optional salt values.
 pub fn expr_id_from_arc<T: ?Sized>(expr: &Arc<T>, salt: &[u64]) -> u64 {
     // Hash pointer address and process ID together to create expr_id.
     // - ptr: unique address per Arc within a process
@@ -486,18 +474,21 @@ pub fn expr_id_from_arc<T: ?Sized>(expr: &Arc<T>, salt: &[u64]) -> u64 {
     hasher.finish()
 }
 
+/// Re-hash an existing expr id with a salt to produce a new unique id.
+/// This is used by serializers that need to add a session-specific salt
+/// to prevent cross-process collisions.
+pub fn salted_expr_id(id: u64, salt: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    salt.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A unique identifier for a physical expression.
 ///
 /// If two expressions have the same External identifier, then they are
 /// equivalent and interchangeable.
 pub type ExternalPhysicalExprId = u64;
-
-/// A unique identifier for a physical expression.
-///
-/// If two expressions have the same Internal identifier, then they are not equivalent and
-/// interchangeable, but are related in some way. [`PhysicalExpr::link_expr`] allows exprs to
-/// define how they want to be linked together.
-pub type InternalPhysicalExprId = u64;
 
 #[deprecated(
     since = "50.0.0",
