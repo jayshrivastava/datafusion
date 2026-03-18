@@ -3180,8 +3180,22 @@ fn dynamic_filter_outer_inner_equal(
     filter_expr_1: &Arc<dyn PhysicalExpr>,
     filter_expr_2: &Arc<dyn PhysicalExpr>,
 ) -> (bool, bool) {
-    let (simple_id_1, complex_id_1) = Arc::clone(filter_expr_1).expr_id(&[]);
-    let (simple_id_2, complex_id_2) = Arc::clone(filter_expr_2).expr_id(&[]);
+    let simple_id_1 = Arc::clone(filter_expr_1).expr_id();
+    let simple_id_2 = Arc::clone(filter_expr_2).expr_id();
+    let complex_id_1 = DynamicFilterSnapshot::from(
+        filter_expr_1
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap(),
+    )
+    .inner_id();
+    let complex_id_2 = DynamicFilterSnapshot::from(
+        filter_expr_2
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap(),
+    )
+    .inner_id();
     (
         simple_id_1.unwrap() == simple_id_2.unwrap(),
         complex_id_1.unwrap() == complex_id_2.unwrap(),
@@ -3281,8 +3295,22 @@ fn test_deduplication_of_dynamic_filter_expression(
     );
 
     // They should have the same inner_id (shared inner state)
-    let df1_complex_id = Arc::clone(filter1_deserialized).expr_id(&[]).1.unwrap();
-    let df2_complex_id = Arc::clone(filter2_deserialized).expr_id(&[]).1.unwrap();
+    let df1_complex_id = DynamicFilterSnapshot::from(
+        filter1_deserialized
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap(),
+    )
+    .inner_id()
+    .unwrap();
+    let df2_complex_id = DynamicFilterSnapshot::from(
+        filter2_deserialized
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap(),
+    )
+    .inner_id()
+    .unwrap();
     assert_eq!(
         inner_equal,
         df1_complex_id == df2_complex_id,

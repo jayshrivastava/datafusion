@@ -56,6 +56,7 @@ use datafusion_functions_table::generate_series::{
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
 use datafusion_physical_expr::{LexOrdering, LexRequirement, PhysicalExprRef};
+use datafusion_physical_expr_common::physical_expr::salted_expr_id;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
 };
@@ -3883,9 +3884,12 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode> {
         let mut proto = serialize_physical_expr_with_converter(expr, codec, self)?;
-        let (simple_id, complex_id) = Arc::clone(expr).expr_id(&[self.session_id]);
-        proto.external_expr_id = simple_id;
-        proto.internal_expr_id = complex_id;
+        proto.external_expr_id = proto
+            .external_expr_id
+            .map(|id| salted_expr_id(id, self.session_id));
+        proto.internal_expr_id = proto
+            .internal_expr_id
+            .map(|id| salted_expr_id(id, self.session_id));
         Ok(proto)
     }
 }
@@ -3944,7 +3948,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
             if let Some(cached_expr) = self.cache.borrow().get(&internal_expr_id) {
                 // If the deserialized expr is linked to the cached expr via a complex id, then link them
                 // together.
-                expr = expr.link_expr(Arc::clone(cached_expr), internal_expr_id)?;
+                expr = expr.link_expr(Arc::clone(cached_expr))?;
             } else {
                 // Cache miss on the complex expr id. We must cache the expr.
                 self.cache
