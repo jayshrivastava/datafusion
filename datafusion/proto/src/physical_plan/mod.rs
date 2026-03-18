@@ -3825,10 +3825,10 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
     }
 }
 
-/// Internal serializer that adds external_expr_id/internal_expr_id to expressions.
-/// Created fresh for each serialization operation.
+/// Internal serializer that makes distinct expr_ids for each serialization session.
 struct DeduplicatingSerializer {
-    /// Random salt combined with pointer addresses and process ID to create globally unique expr_ids.
+    /// Random salt for this serializer which gets hashed with expression ids to create
+    /// unique ids for this serialization session.
     session_id: u64,
 }
 
@@ -3884,14 +3884,11 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode> {
         let mut proto = serialize_physical_expr_with_converter(expr, codec, self)?;
-        proto.external_expr_id = Arc::clone(expr)
-            .expr_id()
+        proto.external_expr_id = proto
+            .external_expr_id
             .map(|id| salted_expr_id(id, &[self.session_id]));
-        proto.internal_expr_id = expr
-            .as_dedupable()
-            .map(|d| d.dedup_snapshot())
-            .transpose()?
-            .and_then(|s| s.internal_expr_id())
+        proto.internal_expr_id = proto
+            .internal_expr_id
             .map(|id| salted_expr_id(id, &[self.session_id]));
         Ok(proto)
     }
@@ -3950,9 +3947,9 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
         if let Some(internal_expr_id) = proto.internal_expr_id {
             if let Some(cached_expr) = self.cache.borrow().get(&internal_expr_id) {
                 // If the deserialized expr shares state with the cached expr,
-                // reconnect them via link_expr.
+                // reconnect them via dedupe.
                 if let Some(dedupable) = expr.as_dedupable() {
-                    expr = dedupable.link_expr(cached_expr.as_ref())?;
+                    expr = dedupable.dedupe(cached_expr.as_ref())?;
                 }
             } else {
                 // Cache miss on the internal expr id. We must cache the expr.

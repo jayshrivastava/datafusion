@@ -1308,18 +1308,18 @@ pub struct PhysicalExtensionNode {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalExprNode {
     /// Simple unique identifier for this expression to do deduplication during deserialization.
-    /// When serializing, this is set to a unique identifier for each combination of
-    /// expression, process and serialization run.
+    /// When serializing, this is set to a unique identifier for an expression within a process
+    /// and serialization run.
     /// When deserializing, if this ID has been seen before, the cached Arc is returned
     /// instead of creating a new one, enabling reconstruction of referential integrity
     /// across serde roundtrips.
-    /// Two expressions with the same external_expr_id are equivalent and interchangeable.
     #[prost(uint64, optional, tag = "30")]
     pub external_expr_id: ::core::option::Option<u64>,
     /// Complex unique identifier for this expression.
-    /// Two expressions with the same internal_expr_id are not equivalent and
-    /// interchangeable, but are related in some way. PhysicalExpr::link_expr is used
-    /// to create this relationship between expressions.
+    /// When serializing, this is set to a unique identifier for an expression within a process
+    /// and serialization run.
+    /// When deserializing, the expression type itself determines how to reconsile expressions
+    /// which share the same identifier.
     #[prost(uint64, optional, tag = "31")]
     pub internal_expr_id: ::core::option::Option<u64>,
     #[prost(
@@ -1393,12 +1393,6 @@ pub struct PhysicalDynamicFilterNode {
     pub inner_expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(bool, tag = "5")]
     pub is_complete: bool,
-    /// Identifies the shared inner state for DynamicFilterPhysicalExpr.
-    /// Multiple expressions may have different expr_id values (different outer Arc wrappers)
-    /// but the same inner_id (shared inner state).
-    /// Used to reconstruct shared inner state during deserialization.
-    #[prost(uint64, optional, tag = "6")]
-    pub inner_id: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalScalarUdfNode {

@@ -16501,9 +16501,6 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         if self.is_complete {
             len += 1;
         }
-        if self.inner_id.is_some() {
-            len += 1;
-        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalDynamicFilterNode", len)?;
         if !self.children.is_empty() {
             struct_ser.serialize_field("children", &self.children)?;
@@ -16521,11 +16518,6 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         }
         if self.is_complete {
             struct_ser.serialize_field("isComplete", &self.is_complete)?;
-        }
-        if let Some(v) = self.inner_id.as_ref() {
-            #[allow(clippy::needless_borrow)]
-            #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("innerId", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -16545,8 +16537,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             "innerExpr",
             "is_complete",
             "isComplete",
-            "inner_id",
-            "innerId",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16556,7 +16546,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             Generation,
             InnerExpr,
             IsComplete,
-            InnerId,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16583,7 +16572,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             "generation" => Ok(GeneratedField::Generation),
                             "innerExpr" | "inner_expr" => Ok(GeneratedField::InnerExpr),
                             "isComplete" | "is_complete" => Ok(GeneratedField::IsComplete),
-                            "innerId" | "inner_id" => Ok(GeneratedField::InnerId),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16608,7 +16596,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                 let mut generation__ = None;
                 let mut inner_expr__ = None;
                 let mut is_complete__ = None;
-                let mut inner_id__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Children => {
@@ -16643,14 +16630,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             }
                             is_complete__ = Some(map_.next_value()?);
                         }
-                        GeneratedField::InnerId => {
-                            if inner_id__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("innerId"));
-                            }
-                            inner_id__ = 
-                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
-                            ;
-                        }
                     }
                 }
                 Ok(PhysicalDynamicFilterNode {
@@ -16659,7 +16638,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                     generation: generation__.unwrap_or_default(),
                     inner_expr: inner_expr__,
                     is_complete: is_complete__.unwrap_or_default(),
-                    inner_id: inner_id__,
                 })
             }
         }

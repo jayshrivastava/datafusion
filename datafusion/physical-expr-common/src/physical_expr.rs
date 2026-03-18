@@ -443,7 +443,7 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     }
 
     /// Returns a unique identifier for this expression. Ids are globally unique within
-    /// a process.
+    /// a process, as long as the [`Arc<dyn PhysicalExpr>`] is not dropped.
     ///
     /// If two expressions have the same identifier, then they are equivalent and
     /// interchangeable: in a given query plan, if one [`PhysicalExpr`] is used in place
@@ -452,32 +452,34 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         Some(expr_id_from_arc(&self, &[]))
     }
 
-    /// Returns this expression as a [`DedupablePhysicalExpr`] if it supports
-    /// dedup-aware serialization with shared mutable state.
+    /// Returns this expression as a [`DedupablePhysicalExpr`] if the expression implements 
+    /// its own deduplication behavior.
     fn as_dedupable(&self) -> Option<&dyn DedupablePhysicalExpr> {
         None
     }
 }
 
-/// Snapshot of a dynamic expression's state for dedup-aware serialization and 
-/// deserialization.
+/// Snapshot of an expression's state for dedup-aware serialization and deserialization.
 pub trait DedupSnapshot: Send + Sync {
-    /// Returns an identifier. Two snapshots of a [`DedupablePhysicalExpr`] with
-    /// the same `internal_expr_id` will be reconnected after deserialization using
-    /// [`DedupablePhysicalExpr::link_expr`].
+    /// Returns an identifier. Two [`DedupablePhysicalExpr`] with the same
+    /// identifier will be reconnected after deserialization using [`DedupablePhysicalExpr::dedupe`].
+    ///
+    /// These must be globally unique within a process as well, so they do not conflict with
+    /// [`PhysicalExpr::expr_id`].
     fn internal_expr_id(&self) -> Option<u64>;
 }
 
-/// A [`PhysicalExpr`] that participates in dedup-aware serialization/deserialization.
+/// A [`PhysicalExpr`] which internally handles deduplication. Typically, expressions can be deduped
+/// trivially using their [`PhysicalExpr::expr_id`]. However, some expressions may choose to define
+/// their own deduplication behavior using this trait.
 pub trait DedupablePhysicalExpr: PhysicalExpr {
-    /// Atomically capture the state of this expression for serialization.
+    /// Atomically capture the state of this expression and provide an identifier.
     fn dedup_snapshot(&self) -> Result<Box<dyn DedupSnapshot>>;
 
-    /// Returns a new expression that links `self` to the `donor`. The behavior
-    /// of "linking" is up to the [`PhysicalExpr`] implementor.
-    fn link_expr(
+    /// Returns a new expression that dedupes `self` with `other`. 
+    fn dedupe(
         &self,
-        donor: &dyn PhysicalExpr,
+        other: &dyn PhysicalExpr,
     ) -> Result<Arc<dyn PhysicalExpr>>;
 }
 

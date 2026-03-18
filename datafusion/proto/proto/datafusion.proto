@@ -876,18 +876,18 @@ message PhysicalExprNode {
   reserved 17;
 
   // Simple unique identifier for this expression to do deduplication during deserialization.
-  // When serializing, this is set to a unique identifier for each combination of
-  // expression, process and serialization run.
+  // When serializing, this is set to a unique identifier for an expression within a process
+  // and serialization run.
   // When deserializing, if this ID has been seen before, the cached Arc is returned
   // instead of creating a new one, enabling reconstruction of referential integrity
   // across serde roundtrips.
-  // Two expressions with the same external_expr_id are equivalent and interchangeable.
   optional uint64 external_expr_id = 30;
 
-  // Complex unique identifier for this expression.
-  // Two expressions with the same internal_expr_id are not equivalent and
-  // interchangeable, but are related in some way. PhysicalExpr::link_expr is used
-  // to create this relationship between expressions.
+  // Complex unique identifier for this expression. 
+  // When serializing, this is set to a unique identifier for an expression within a process
+  // and serialization run.
+  // When deserializing, the expression type itself determines how to reconsile expressions
+  // which share the same identifier.
   optional uint64 internal_expr_id = 31;
 
   oneof ExprType {
@@ -938,11 +938,6 @@ message PhysicalDynamicFilterNode {
   uint64 generation = 3;
   PhysicalExprNode inner_expr = 4;
   bool is_complete = 5;
-  // Identifies the shared inner state for DynamicFilterPhysicalExpr.
-  // Multiple expressions may have different expr_id values (different outer Arc wrappers)
-  // but the same inner_id (shared inner state).
-  // Used to reconstruct shared inner state during deserialization.
-  optional uint64 inner_id = 6;
 }
 
 message PhysicalScalarUdfNode {

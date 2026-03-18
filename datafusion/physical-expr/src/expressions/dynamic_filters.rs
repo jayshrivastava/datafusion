@@ -141,7 +141,6 @@ impl DynamicFilterSnapshot {
     pub fn is_complete(&self) -> bool {
         self.is_complete
     }
-
 }
 
 impl DedupSnapshot for DynamicFilterSnapshot {
@@ -588,10 +587,7 @@ impl DedupablePhysicalExpr for DynamicFilterPhysicalExpr {
         Ok(Box::new(DynamicFilterSnapshot::from(self)))
     }
 
-    fn link_expr(
-        &self,
-        donor: &dyn PhysicalExpr,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
+    fn dedupe(&self, other: &dyn PhysicalExpr) -> Result<Arc<dyn PhysicalExpr>> {
         // If there are watchers on the state channel, the filter is in active use
         // and we should not replace its inner state.
         if self.state_watch.receiver_count() > 0 {
@@ -600,7 +596,7 @@ impl DedupablePhysicalExpr for DynamicFilterPhysicalExpr {
             );
         };
 
-        let Some(other) = donor.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+        let Some(other) = other.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
         else {
             return internal_err!(
                 "Cannot link DynamicFilterPhysicalExpr with an expression that is not DynamicFilterPhysicalExpr"
@@ -1070,7 +1066,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_link_expr() {
+    async fn test_dedupe_expr() {
         // Create a source filter
         let source = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![],
@@ -1085,8 +1081,8 @@ mod test {
             lit(0) as Arc<dyn PhysicalExpr>,
         ));
 
-        // Link source to target via link_expr.
-        let combined = target.link_expr(source.as_ref()).unwrap();
+        // Link source to target via dedupe.
+        let combined = target.dedupe(source.as_ref()).unwrap();
 
         // Verify inner state is shared via snapshot internal_expr_id
         let combined_df = combined
@@ -1097,9 +1093,12 @@ mod test {
             .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap();
-        let combined_internal_expr_id =
-            DynamicFilterSnapshot::from(combined_df).internal_expr_id().unwrap();
-        let source_internal_expr_id = DynamicFilterSnapshot::from(source_df).internal_expr_id().unwrap();
+        let combined_internal_expr_id = DynamicFilterSnapshot::from(combined_df)
+            .internal_expr_id()
+            .unwrap();
+        let source_internal_expr_id = DynamicFilterSnapshot::from(source_df)
+            .internal_expr_id()
+            .unwrap();
         assert_eq!(
             combined_internal_expr_id, source_internal_expr_id,
             "dynamic filters with shared inner state should have the same internal id"
