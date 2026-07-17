@@ -472,6 +472,27 @@ const HASH_QUERIES: &[HashJoinQuery] = &[
         probe_size: "2.3M_long_keys_count",
         isolate_partitioned_join: true,
     },
+    // Q24: selective build-side order key range against clustered lineitem.
+    // Build ~1K order keys from orders; probe scans lineitem on its stored
+    // l_orderkey column. This is intended to make hash join dynamic filters
+    // useful for Parquet row-group pruning.
+    HashJoinQuery {
+        sql: r###"SELECT count(*)
+        FROM (
+          SELECT o_orderkey AS k
+          FROM orders
+          WHERE o_orderkey BETWEEN 1000000 AND 1001000
+        ) o
+        JOIN (
+          SELECT l_orderkey AS k
+          FROM lineitem
+        ) l ON o.k = l.k"###,
+        density: 1.0,
+        prob_hit: 1.0,
+        build_size: "1K_orderkey_range",
+        probe_size: "60M_lineitem_orderkey_count",
+        isolate_partitioned_join: true,
+    },
 ];
 
 impl RunOpt {
@@ -499,7 +520,7 @@ impl RunOpt {
         let ctx = SessionContext::new_with_config_rt(config, rt);
 
         if let Some(path) = &self.path {
-            for table in &["lineitem", "supplier", "nation", "customer"] {
+            for table in &["lineitem", "supplier", "nation", "customer", "orders"] {
                 let table_path = path.join(table);
                 if !table_path.exists() {
                     return exec_err!(
@@ -533,7 +554,7 @@ impl RunOpt {
             );
             benchmark_run.start_new_case(&case_name);
 
-            // For Q23 force Partitioned mode: zero the CollectLeft thresholds
+            // For selected queries force Partitioned mode: zero the CollectLeft thresholds
             // so the planner cannot prove the build side is small (as happens
             // when the datasource provides no row-count stats).
             if query.isolate_partitioned_join {
