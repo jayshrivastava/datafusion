@@ -1621,6 +1621,15 @@ config_namespace! {
         /// See: <https://trino.io/docs/current/admin/dynamic-filtering.html#dynamic-filter-collection-thresholds>
         pub hash_join_inlist_pushdown_max_distinct_values: usize, default = 150
 
+        /// Controls how partitioned hash join dynamic filters are lowered.
+        ///
+        /// Valid values:
+        /// - `case`: route probe rows by hash partition and apply only that partition's filter.
+        /// - `global_or`: apply the OR of all partition filters to every probe partition.
+        ///
+        /// This option exists to benchmark partition-aware dynamic filtering overhead.
+        pub hash_join_dynamic_filter_partitioned_expr_style: String, transform = str::to_lowercase, default = "case".into()
+
         /// The default filter selectivity used by Filter Statistics
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).

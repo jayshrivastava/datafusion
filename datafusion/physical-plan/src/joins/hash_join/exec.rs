@@ -35,7 +35,8 @@ use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
-    ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
+    ColumnBounds, PartitionBounds, PartitionedDynamicFilterExprStyle, PushdownStrategy,
+    SharedBuildAccumulator,
 };
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -1385,6 +1386,14 @@ impl ExecutionPlan for HashJoinExec {
             .with_category(MetricCategory::Rows)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
+        let partitioned_expr_style = enable_dynamic_filter_pushdown
+            .then(|| {
+                PartitionedDynamicFilterExprStyle::from_config(
+                    context.session_config().options(),
+                )
+            })
+            .transpose()?;
+
         // Initialize build_accumulator lazily with runtime partition counts (only if enabled)
         // Use RepartitionExec's random state (seeds: 0,0,0,0) for partition routing
         let repartition_random_state = REPARTITION_RANDOM_STATE;
@@ -1405,6 +1414,8 @@ impl ExecutionPlan for HashJoinExec {
                             filter,
                             on_right,
                             repartition_random_state,
+                            partitioned_expr_style
+                                .expect("style parsed when dynamic filter is enabled"),
                         ))
                     })))
                 })

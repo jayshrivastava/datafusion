@@ -203,6 +203,17 @@ fn combine_membership_and_bounds(
     }
 }
 
+fn or_predicates(
+    predicates: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
+) -> Arc<dyn PhysicalExpr> {
+    predicates
+        .into_iter()
+        .reduce(|acc, pred| {
+            Arc::new(BinaryExpr::new(acc, Operator::Or, pred)) as Arc<dyn PhysicalExpr>
+        })
+        .unwrap_or_else(|| lit(false))
+}
+
 /// Coordinates build-side information collection across multiple partitions
 ///
 /// This structure collects information from the build side (hash tables and/or bounds) and
@@ -255,6 +266,33 @@ pub(crate) struct SharedBuildAccumulator {
     repartition_random_state: SeededRandomState,
     /// Schema of the probe (right) side for evaluating filter expressions
     probe_schema: Arc<Schema>,
+    /// How partitioned dynamic filters should be lowered.
+    partitioned_expr_style: PartitionedDynamicFilterExprStyle,
+}
+
+/// Expression shape used for partitioned hash join dynamic filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionedDynamicFilterExprStyle {
+    /// Route probe rows by hash partition and evaluate only that partition's filter.
+    Case,
+    /// Apply the OR of all partition filters to every probe partition.
+    GlobalOr,
+}
+
+impl PartitionedDynamicFilterExprStyle {
+    pub(crate) fn from_config(config: &ConfigOptions) -> Result<Self> {
+        match config
+            .optimizer
+            .hash_join_dynamic_filter_partitioned_expr_style
+            .as_str()
+        {
+            "case" => Ok(Self::Case),
+            "global_or" => Ok(Self::GlobalOr),
+            other => datafusion_common::config_err!(
+                "Invalid value for datafusion.optimizer.hash_join_dynamic_filter_partitioned_expr_style: {other}. Expected one of: case, global_or"
+            ),
+        }
+    }
 }
 
 /// Strategy for filter pushdown (decided at collection time)
@@ -358,6 +396,7 @@ impl SharedBuildAccumulator {
         dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
         on_right: Vec<PhysicalExprRef>,
         repartition_random_state: SeededRandomState,
+        partitioned_expr_style: PartitionedDynamicFilterExprStyle,
     ) -> Self {
         // Troubleshooting: If partition counts are incorrect, verify this logic matches
         // the actual execution pattern in collect_build_side()
@@ -404,6 +443,7 @@ impl SharedBuildAccumulator {
             on_right,
             repartition_random_state,
             probe_schema: right_child.schema(),
+            partitioned_expr_style,
         }
     }
 
@@ -650,39 +690,57 @@ impl SharedBuildAccumulator {
                     }
                 }
 
-                let filter_expr = if has_canceled_unknown {
-                    let mut when_then_branches = empty_partition_ids
-                        .into_iter()
-                        .map(|partition_id| {
-                            (
-                                lit(ScalarValue::UInt64(Some(partition_id as u64))),
-                                lit(false),
+                let filter_expr = match self.partitioned_expr_style {
+                    PartitionedDynamicFilterExprStyle::GlobalOr => {
+                        if has_canceled_unknown {
+                            lit(true)
+                        } else {
+                            or_predicates(
+                                real_branches
+                                    .into_iter()
+                                    .map(|(_, branch_expr)| branch_expr),
                             )
-                        })
-                        .collect::<Vec<_>>();
-                    when_then_branches.extend(real_branches);
-
-                    if when_then_branches.is_empty() {
-                        lit(true)
-                    } else {
-                        Arc::new(CaseExpr::try_new(
-                            Some(modulo_expr),
-                            when_then_branches,
-                            Some(lit(true)),
-                        )?) as Arc<dyn PhysicalExpr>
+                        }
                     }
-                } else if real_branches.is_empty() {
-                    lit(false)
-                } else if real_branches.len() == 1
-                    && empty_partition_ids.len() + 1 == num_partitions
-                {
-                    Arc::clone(&real_branches[0].1)
-                } else {
-                    Arc::new(CaseExpr::try_new(
-                        Some(modulo_expr),
-                        real_branches,
-                        Some(lit(false)),
-                    )?) as Arc<dyn PhysicalExpr>
+                    PartitionedDynamicFilterExprStyle::Case => {
+                        if has_canceled_unknown {
+                            let mut when_then_branches = empty_partition_ids
+                                .into_iter()
+                                .map(|partition_id| {
+                                    (
+                                        lit(ScalarValue::UInt64(Some(
+                                            partition_id as u64,
+                                        ))),
+                                        lit(false),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            when_then_branches.extend(real_branches);
+
+                            if when_then_branches.is_empty() {
+                                lit(true)
+                            } else {
+                                Arc::new(CaseExpr::try_new(
+                                    Some(modulo_expr),
+                                    when_then_branches,
+                                    Some(lit(true)),
+                                )?)
+                                    as Arc<dyn PhysicalExpr>
+                            }
+                        } else if real_branches.is_empty() {
+                            lit(false)
+                        } else if real_branches.len() == 1
+                            && empty_partition_ids.len() + 1 == num_partitions
+                        {
+                            Arc::clone(&real_branches[0].1)
+                        } else {
+                            Arc::new(CaseExpr::try_new(
+                                Some(modulo_expr),
+                                real_branches,
+                                Some(lit(false)),
+                            )?) as Arc<dyn PhysicalExpr>
+                        }
+                    }
                 };
 
                 self.dynamic_filter.update(filter_expr)?;
@@ -722,6 +780,7 @@ pub(super) fn make_partitioned_accumulator_for_test(
         on_right: vec![],
         repartition_random_state: SeededRandomState::with_seed(1),
         probe_schema,
+        partitioned_expr_style: PartitionedDynamicFilterExprStyle::Case,
     }
 }
 
@@ -778,6 +837,7 @@ mod tests {
             on_right,
             repartition_random_state: SeededRandomState::with_seed(1),
             probe_schema: test_probe_schema(),
+            partitioned_expr_style: PartitionedDynamicFilterExprStyle::Case,
         }
     }
 
@@ -802,6 +862,14 @@ mod tests {
             },
             test_on_right(),
         )
+    }
+
+    fn make_partitioned_global_or_expr_accumulator_for_test(
+        num_partitions: usize,
+    ) -> SharedBuildAccumulator {
+        let mut acc = make_partitioned_expr_accumulator_for_test(num_partitions);
+        acc.partitioned_expr_style = PartitionedDynamicFilterExprStyle::GlobalOr;
+        acc
     }
 
     fn in_list(values: &[i32]) -> PushdownStrategy {
@@ -958,6 +1026,21 @@ mod tests {
 
         let expr = current_expr(&acc);
         in_list_expr(&expr);
+        assert!(expr.downcast_ref::<CaseExpr>().is_none());
+    }
+
+    #[test]
+    fn partitioned_global_or_style_uses_or_expression() {
+        let acc = make_partitioned_global_or_expr_accumulator_for_test(2);
+
+        acc.build_filter(FinalizeInput::Partitioned(vec![
+            reported(in_list(&[1]), no_bounds()),
+            reported(in_list(&[2]), no_bounds()),
+        ]))
+        .unwrap();
+
+        let expr = current_expr(&acc);
+        assert_top_binary_op(&expr, Operator::Or);
         assert!(expr.downcast_ref::<CaseExpr>().is_none());
     }
 
