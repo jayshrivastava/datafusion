@@ -30,9 +30,10 @@ Cons:
 
 ## Goal
 
-Determine the most performant representation for dynamic filters in partitioned hash joins. This benchmark compares 4
-alternatives:
+Determine the most performant representation for dynamic filters in partitioned hash joins. 
 
+This benchmark compares 4
+alternatives:
 1. `case` - the current partition-aware expression:
 ```text
 CASE hash(expr) % num_partitions
@@ -42,15 +43,21 @@ CASE hash(expr) % num_partitions
   ELSE false
 END
 ```
+note that typically each `filter_expr_for_partition` takes the form of a range expression + a set membership expression like `(some_min <= expr AND expr <= some_max)  AND expr in (some_set_of_keys)
+
 2. `partitioned_or` - `OR` the filter expression for each partition:
 ```text
 filter_expr_for_partition_0 OR filter_expr_for_partition_1 OR filter_expr_for_partition_2 ...
 ```
+note that typically each `filter_expr_for_partition` takes the form of a range expression + a set membership expression like `(some_min <= expr AND expr <= some_max)  AND expr in (some_set_of_keys)
+
 3. `global` - construct one non-partition-aware expression representing all partitions. Typically:
 ```
 (some_min <= expr AND expr <= some_max)  AND expr in (some_set_of_keys)
 ```
+
 For larger build-side sets, the membership component may be a hash-table lookup rather than an `IN` list.
+
 4. `global_bounds_case_membership` - split the expression into global bounds and partition-aware membership:
 ```text
 (global_min <= expr AND expr <= global_max)
@@ -64,7 +71,6 @@ END
 ```
 - idea: let the cheap bounds expression evaluate first before having evaluate the expensive case expression
 - idea: the range expression can be pushed down and used by row group pruning
-
 ## Benchmark Specs
 
 Benchmark: `target/release-nonlto/dfbench hj`
