@@ -122,7 +122,6 @@ datafusion.optimizer.join_reordering = false
 ### Wall Time
 
 Values are milliseconds, averaged across warm iterations 2-5.
-Scores count row wins across each query table: each of the 9 rows contributes one win to the fastest expression type (A-E).
 
 #### Q24
 | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
@@ -223,7 +222,7 @@ Q27 row_groups_pruned_statistics = 524 total -> 6 matched
 ```
 
 Let's focus on cases where dyanmic filtering is useful. These are scores when `pruning=true`:
-
+```
 Score (row wins):
   A off: 9
   B case: 2
@@ -236,9 +235,11 @@ Score without A off (row wins):
   C partitioned_or: 1
   D global: 10
   E bounds+case: 9
+```
 
 If you look at the default datafusion config case only (`pruning=true,row-filter=false`), these are the scores:
 
+```
  Score (row wins):
   A off: 4
   B case: 2
@@ -251,10 +252,12 @@ Score without A off (row wins):
   C partitioned_or: 0
   D global: 5
   E bounds+case: 3
+```
 
 `global` comes out as a winner, but `case` and `bounds+case` are not that far behind. By how
 much does `global` win?
 
+```
 Average wall time across default-config rows for Q24/Q25 only:
 
   B case:            300.394 ms ± 126.990 ms
@@ -268,6 +271,7 @@ Average wall time across default-config rows for Q26/Q27 only:
   C partitioned_or:   31.615 ms ± 21.003 ms
   D global:           19.355 ms ± 10.047 ms
   E bounds+case:      19.399 ms ± 10.091 ms
+```
 
 Clearly, `case` is worse. Should we use `global` or `bounds+case`? If you look at the metrics below,
 cases `D` and `E` effectively prune the same number of row groups. Since `case` is not supported by
@@ -276,10 +280,8 @@ parquet pruning, `E` is likely only effective because of the `bounds` portion, n
 ### Conclusion
 
 `global` and `bounds+case` are effectively in terms of performance, but if you consider that parquet pruning is the most
-important type of filtering, the `case` part of `bounds+case` is less useful.
-
-Either would be more performant than the current `CASE` behavior today, but `global` might have the edge
-just because of simplicity.
+important type of filtering, the `case` part of `bounds+case` is likely less useful. Furthermore, `global`
+takes the edge if you consider simplicity.
 
 ## Appendix
 
