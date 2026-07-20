@@ -21,8 +21,12 @@ ex.
 
 Per partition `CASE`ing was added in https://github.com/apache/datafusion/pull/18451, but there are no benchmarks.
 
-The tradeoff being made is - the `CASE` expression is more expensive (hashing + case iteration) but
-it gives us more selective pruning. Is this trade off worth it?
+The `CASE` has one tradeoff:
+Pro:
+- more selective pruning
+Cons:
+- the `CASE` expression is more expensive (hashing + case iteration)
+- parquet row group pruning does not support `CASE` expressions
 
 ## Goal
 
@@ -58,12 +62,13 @@ CASE hash(expr) % num_partitions
   ELSE false
 END
 ```
-The idea is to let the cheap bounds expression evaluate first before having evaluate the expensive case expression.
+- idea: let the cheap bounds expression evaluate first before having evaluate the expensive case expression
+- idea: the range expression can be pushed down and used by row group pruning
 
 ## Benchmark Specs
 
 Benchmark: `target/release-nonlto/dfbench hj`
-Data: `benchmarks/data/tpch_sf1`
+Data: `benchmarks/data/tpch_sf10`
 Iterations: 5
 
 Other notes:
@@ -119,115 +124,162 @@ datafusion.optimizer.join_reordering = false
 Values are milliseconds, averaged across warm iterations 2-5.
 Scores count row wins across each query table: each of the 9 rows contributes one win to the fastest expression type (A-E).
 
-| Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Q24 | 4 | `default_metadata` | 50.541 | 52.163 | 56.779 | 52.668 | 52.080 |
-| Q24 | 4 | `row_filter_only` | 62.220 | 103.531 | 89.642 | 75.894 | 102.274 |
-| Q24 | 4 | `full` | 58.624 | 103.759 | 92.325 | 75.920 | 103.246 |
-| Q24 | default (16) | `default_metadata` | 28.483 | 29.824 | 33.319 | 32.895 | 30.065 |
-| Q24 | default (16) | `row_filter_only` | 30.387 | 68.881 | 92.312 | 27.541 | 58.592 |
-| Q24 | default (16) | `full` | 38.638 | 62.046 | 96.083 | 30.391 | 61.374 |
-| Q24 | 64 | `default_metadata` | 35.846 | 51.511 | 232.355 | 42.075 | 47.708 |
-| Q24 | 64 | `row_filter_only` | 45.729 | 90.845 | 242.004 | 38.810 | 84.901 |
-| Q24 | 64 | `full` | 38.306 | 105.232 | 382.046 | 40.099 | 97.558 |
+#### Q24
+| Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | `default_metadata` | 465.722 | 460.473 | 477.449 | 468.485 | 470.486 |
+| 4 | `row_filter_only` | 526.440 | 995.163 | 1015.830 | 975.521 | 982.981 |
+| 4 | `full` | 528.997 | 1000.302 | 1020.449 | 974.146 | 994.457 |
+| default (16) | `default_metadata` | 188.199 | 196.423 | 203.589 | 193.877 | 195.594 |
+| default (16) | `row_filter_only` | 220.484 | 461.659 | 907.010 | 809.177 | 419.129 |
+| default (16) | `full` | 208.501 | 453.950 | 880.840 | 835.290 | 426.193 |
+| 64 | `default_metadata` | 204.922 | 225.884 | 343.552 | 264.708 | 247.542 |
+| 64 | `row_filter_only` | 227.413 | 745.341 | 2809.371 | 181.595 | 664.311 |
+| 64 | `full` | 226.891 | 742.657 | 2824.108 | 218.150 | 692.601 |
 
 Score (row wins):
 `A off`: 6
-`B case`: 0
-`C partitioned_or`: 0
-`D global`: 3
-`E bounds+case`: 0
-
-Score without A off (row wins):
 `B case`: 1
 `C partitioned_or`: 0
-`D global`: 7
-`E bounds+case`: 1
+`D global`: 2
+`E bounds+case`: 0
 
-| Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Q25 | 4 | `default_metadata` | 54.740 | 55.748 | 59.245 | 55.857 | 55.573 |
-| Q25 | 4 | `row_filter_only` | 66.969 | 126.795 | 129.224 | 123.826 | 120.726 |
-| Q25 | 4 | `full` | 67.562 | 121.812 | 134.823 | 123.899 | 122.313 |
-| Q25 | default (16) | `default_metadata` | 28.037 | 36.444 | 32.658 | 31.362 | 31.893 |
-| Q25 | default (16) | `row_filter_only` | 32.295 | 77.946 | 114.891 | 106.055 | 63.583 |
-| Q25 | default (16) | `full` | 45.261 | 66.877 | 122.726 | 100.535 | 71.092 |
-| Q25 | 64 | `default_metadata` | 38.538 | 39.552 | 60.244 | 48.357 | 39.563 |
-| Q25 | 64 | `row_filter_only` | 39.059 | 116.667 | 432.206 | 365.344 | 89.540 |
-| Q25 | 64 | `full` | 44.417 | 102.948 | 439.042 | 353.950 | 101.340 |
+#### Q25
+| Mode | A off | B case | C partitioned_or | D global | E bounds+case |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | `default_metadata` | 504.448 | 496.652 | 508.760 | 498.044 | 497.850 |
+| 4 | `row_filter_only` | 587.939 | 1142.925 | 1224.557 | 1165.142 | 1131.838 |
+| 4 | `full` | 588.277 | 1147.174 | 1257.571 | 1241.397 | 1126.717 |
+| default (16) | `default_metadata` | 191.018 | 198.033 | 205.095 | 203.688 | 207.899 |
+| default (16) | `row_filter_only` | 225.449 | 521.935 | 968.712 | 898.191 | 493.396 |
+| default (16) | `full` | 232.169 | 546.574 | 971.855 | 911.401 | 474.788 |
+| 64 | `default_metadata` | 211.896 | 224.901 | 287.008 | 212.029 | 219.145 |
+| 64 | `row_filter_only` | 237.690 | 834.370 | 3261.935 | 2570.214 | 754.216 |
+| 64 | `full` | 229.238 | 861.605 | 3358.274 | 2641.969 | 768.966 |
 
-Score (row wins):
-`A off`: 9
-`B case`: 0
+Score (# of row wins):
+`A off`: 8
+`B case`: 1
 `C partitioned_or`: 0
 `D global`: 0
 `E bounds+case`: 0
 
-Score without A off (row wins):
-`B case`: 3
-`C partitioned_or`: 0
-`D global`: 1
-`E bounds+case`: 5
+#### Q26
+| Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | `default_metadata` | 303.127 | 302.613 | 7.667 | 7.588 | 7.066 |
+| 4 | `row_filter_only` | 397.303 | 747.175 | 308.117 | 257.679 | 254.426 |
+| 4 | `full` | 306.680 | 645.800 | 7.624 | 7.820 | 7.639 |
+| default (16) | `default_metadata` | 134.375 | 136.663 | 18.758 | 8.704 | 8.402 |
+| default (16) | `row_filter_only` | 165.517 | 384.938 | 166.648 | 94.257 | 97.480 |
+| default (16) | `full` | 134.065 | 329.371 | 21.677 | 8.562 | 8.657 |
+| 64 | `default_metadata` | 141.490 | 142.441 | 64.229 | 18.099 | 18.675 |
+| 64 | `row_filter_only` | 176.555 | 659.980 | 366.343 | 103.526 | 93.050 |
+| 64 | `full` | 153.503 | 614.553 | 63.605 | 17.810 | 17.817 |
 
-| Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Q26 | 4 | `default_metadata` | 36.693 | 36.806 | 7.317 | 6.786 | 6.667 |
-| Q26 | 4 | `row_filter_only` | 52.096 | 81.856 | 34.943 | 31.893 | 33.056 |
-| Q26 | 4 | `full` | 36.198 | 72.510 | 7.554 | 6.888 | 6.965 |
-| Q26 | default (16) | `default_metadata` | 23.497 | 23.016 | 20.021 | 8.360 | 8.719 |
-| Q26 | default (16) | `row_filter_only` | 23.424 | 52.294 | 32.095 | 19.001 | 18.285 |
-| Q26 | default (16) | `full` | 19.832 | 45.611 | 23.606 | 8.690 | 8.766 |
-| Q26 | 64 | `default_metadata` | 31.852 | 33.170 | 67.611 | 18.242 | 18.900 |
-| Q26 | 64 | `row_filter_only` | 31.237 | 83.950 | 82.842 | 25.919 | 25.736 |
-| Q26 | 64 | `full` | 28.761 | 92.670 | 68.243 | 17.389 | 17.460 |
+Score (# row wins):
+`A off`: 0
+`B case`: 0
+`C partitioned_or`: 1
+`D global`: 4
+`E bounds+case`: 4
+
+#### Q27
+| Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | `default_metadata` | 364.171 | 359.462 | 26.715 | 25.689 | 24.755 |
+| 4 | `row_filter_only` | 446.116 | 762.978 | 338.652 | 299.793 | 302.268 |
+| 4 | `full` | 358.447 | 668.456 | 55.262 | 53.235 | 58.311 |
+| default (16) | `default_metadata` | 145.684 | 163.675 | 26.044 | 24.933 | 25.352 |
+| default (16) | `row_filter_only` | 179.292 | 429.653 | 241.047 | 182.233 | 145.784 |
+| default (16) | `full` | 150.104 | 360.386 | 113.766 | 104.913 | 66.768 |
+| 64 | `default_metadata` | 178.401 | 175.959 | 46.274 | 31.120 | 32.144 |
+| 64 | `row_filter_only` | 194.232 | 665.976 | 470.282 | 331.513 | 138.800 |
+| 64 | `full` | 168.286 | 631.037 | 381.025 | 287.345 | 98.817 |
 
 Score (row wins):
 `A off`: 0
 `B case`: 0
 `C partitioned_or`: 0
-`D global`: 6
-`E bounds+case`: 3
+`D global`: 4
+`E bounds+case`: 5
 
-Score without A off (row wins):
-`B case`: 0
-`C partitioned_or`: 0
-`D global`: 6
-`E bounds+case`: 3
+## Analysis
 
-| Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Q27 | 4 | `default_metadata` | 52.523 | 46.899 | 24.520 | 23.624 | 23.914 |
-| Q27 | 4 | `row_filter_only` | 53.927 | 106.274 | 73.510 | 67.825 | 69.298 |
-| Q27 | 4 | `full` | 47.331 | 97.739 | 60.068 | 52.757 | 53.190 |
-| Q27 | default (16) | `default_metadata` | 24.165 | 29.877 | 20.274 | 17.839 | 18.720 |
-| Q27 | default (16) | `row_filter_only` | 28.419 | 65.502 | 87.211 | 79.177 | 58.562 |
-| Q27 | default (16) | `full` | 25.920 | 61.518 | 83.972 | 73.317 | 48.940 |
-| Q27 | 64 | `default_metadata` | 39.479 | 39.494 | 37.892 | 22.719 | 23.350 |
-| Q27 | 64 | `row_filter_only` | 38.924 | 86.831 | 122.313 | 81.717 | 42.856 |
-| Q27 | 64 | `full` | 39.519 | 88.041 | 114.784 | 83.150 | 38.942 |
+Firstly, when is turning dynamic filtering off good?
+
+All wins for `A off` are when
+(a) pruning is disabled (`row_filter_only`) or
+(b) when clustering is low (q24 and q25), meaning row group pruning is not effective
+
+This are backed by metrics in the appendix below. For q24 and q25, we see that no row groups are pruned
+```
+row_groups_pruned_statistics = 524 total -> 524 matched
+```
+For q26 and q27, we prune far more rows:
+```
+Q26 row_groups_pruned_statistics = 524 total -> 1 matched
+Q27 row_groups_pruned_statistics = 524 total -> 6 matched
+```
+
+Let's focus on cases where dyanmic filtering is useful. These are scores when `pruning=true`:
 
 Score (row wins):
-`A off`: 5
-`B case`: 0
-`C partitioned_or`: 0
-`D global`: 3
-`E bounds+case`: 1
+  A off: 9
+  B case: 2
+  C partitioned_or: 1
+  D global: 7
+  E bounds+case: 5
 
 Score without A off (row wins):
-`B case`: 0
-`C partitioned_or`: 0
-`D global`: 5
-`E bounds+case`: 4
+  B case: 4
+  C partitioned_or: 1
+  D global: 10
+  E bounds+case: 9
 
-## Short Analysis
+If you look at the default datafusion config case only (`pruning=true,row-filter=false`), these are the scores:
 
-- `global` is the most consistently strong dynamic-filter shape in this run. It is the best dynamic style for Q24 in all modes, best for Q26, and close on Q27 default/metadata mode. Its advantage is that it creates one ordinary global predicate, so parquet pruning and row filtering do not have to route through a partition CASE and do not have to evaluate a large OR tree.
-- `global_bounds_case_membership` is best on wider ranges where global bounds are useful but preserving partition-routed membership still avoids too many false positives. It is the best dynamic style for Q25 default/metadata and Q27 row-filter/full mode, but it still pays CASE routing for membership.
-- Dynamic filtering is not automatically a win. On date-based Q25, the dynamic-off baseline is faster than every dynamic-filter style in the full/default-partition run because row-group pruning does not improve and row filtering adds CPU. The strongest wins are on clustered key-range queries Q26/Q27, where non-CASE dynamic predicates unlock row-group and page pruning.
-- `case` is usually worse when `pushdown_filters=true`; the row-filter-only table shows the cost directly. `CaseExpr` evaluates the partition expression once, then iterates `WHEN` branches over remaining rows and evaluates only matching `THEN` predicates. It is not all predicates for all rows, but it is still CPU-heavy as partition count rises and it hides useful predicates from parquet pruning.
-- `partitioned_or` is the weakest overall. It removes CASE routing, but it expands to an OR of per-partition predicates. At 64 partitions that large expression is expensive, and in several cases it is slower than both `global` and `global_bounds_case_membership`.
-- Row-group pruning matters a lot only for the clustered key-range queries. Q26 full/default with `global` scans roughly one lineitem row group (`row_groups_pruned_statistics=53 total -> 1 matched`, `bytes_scanned=113.5 K`), while `case` keeps all row groups alive. For the date-based Q24/Q25 queries, dynamic values are spread across order keys, so row-group pruning is much less helpful.
-- Removing CASE can lose partition-local selectivity: global and OR-style filters can admit rows matching another partition's predicate. The results here suggest that for clustered range-friendly keys, the pruning and CPU wins dominate that loss. For wider/non-clustered filters, the hybrid `global_bounds_case_membership` can be a better compromise.
+ Score (row wins):
+  A off: 4
+  B case: 2
+  C partitioned_or: 0
+  D global: 3
+  E bounds+case: 3
+
+Score without A off (row wins):
+  B case: 4
+  C partitioned_or: 0
+  D global: 5
+  E bounds+case: 3
+
+`global` comes out as a winner, but `case` and `bounds+case` are not that far behind. By how
+much does `global` win?
+
+Average wall time across default-config rows for Q24/Q25 only:
+
+  B case:            300.394 ms ± 126.990 ms
+  C partitioned_or:  337.575 ms ± 117.383 ms
+  D global:          306.805 ms ± 126.480 ms
+  E bounds+case:     306.419 ms ± 127.637 ms
+
+Average wall time across default-config rows for Q26/Q27 only:
+
+  B case:            213.469 ms ± 101.715 ms
+  C partitioned_or:   31.615 ms ± 21.003 ms
+  D global:           19.355 ms ± 10.047 ms
+  E bounds+case:      19.399 ms ± 10.091 ms
+
+Clearly, `case` is worse. Should we use `global` or `bounds+case`? If you look at the metrics below,
+cases `D` and `E` effectively prune the same number of row groups. Since `case` is not supported by
+parquet pruning, `E` is likely only effective because of the `bounds` portion, not the `case`.
+
+### Conclusion
+
+`global` and `bounds+case` are effectively in terms of performance, but if you consider that parquet pruning is the most
+important type of filtering, the `case` part of `bounds+case` is less useful.
+
+Either would be more performant than the current `CASE` behavior today, but `global` might have the edge
+just because of simplicity.
 
 ## Appendix
 
@@ -301,73 +353,73 @@ JOIN (
 
 | Query | Case | Warm ms | lineitem output_rows | bytes_scanned | row_groups_pruned_statistics | page_index_rows_pruned | row_pushdown_eval_time | statistics_eval_time |
 | --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: |
-| Q24 | A `n/a` | 28.483 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q24 | B `case` | 29.824 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q24 | C `partitioned_or` | 33.319 | 5.98 M | 10.38 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 48ns | 20.93ms |
-| Q24 | D `global` | 32.895 | 5.98 M | 10.38 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 48ns | 16.57ms |
-| Q24 | E `global_bounds_case_membership` | 30.065 | 5.98 M | 10.38 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 48ns | 7.67ms |
-| Q25 | A `n/a` | 28.037 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q25 | B `case` | 36.444 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q25 | C `partitioned_or` | 32.658 | 6.00 M | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 48ns | 5.89ms |
-| Q25 | D `global` | 31.362 | 6.00 M | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 48ns | 2.35ms |
-| Q25 | E `global_bounds_case_membership` | 31.893 | 6.00 M | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 48ns | 1.81ms |
-| Q26 | A `n/a` | 23.497 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q26 | B `case` | 23.016 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q26 | C `partitioned_or` | 20.021 | 20.10 K | 57.81 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 48ns | 3.95ms |
-| Q26 | D `global` | 8.360 | 20.10 K | 57.81 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 48ns | 626.80µs |
-| Q26 | E `global_bounds_case_membership` | 8.719 | 20.10 K | 57.81 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 48ns | 462.70µs |
-| Q27 | A `n/a` | 24.165 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q27 | B `case` | 29.877 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 32ns | 32ns |
-| Q27 | C `partitioned_or` | 20.274 | 524.7 K | 941.1 K | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 48ns | 1.31ms |
-| Q27 | D `global` | 17.839 | 524.7 K | 941.1 K | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 48ns | 442.28µs |
-| Q27 | E `global_bounds_case_membership` | 18.720 | 524.7 K | 941.1 K | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 48ns | 373.70µs |
+| Q24 | A `n/a` | 188.199 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q24 | B `case` | 196.423 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q24 | C `partitioned_or` | 203.589 | 59.97 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 48ns | 6.71ms |
+| Q24 | D `global` | 193.877 | 59.97 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 48ns | 2.17ms |
+| Q24 | E `global_bounds_case_membership` | 195.594 | 59.97 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 48ns | 2.26ms |
+| Q25 | A `n/a` | 191.018 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q25 | B `case` | 198.033 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q25 | C `partitioned_or` | 205.095 | 59.99 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 48ns | 5.14ms |
+| Q25 | D `global` | 203.688 | 59.99 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 48ns | 2.18ms |
+| Q25 | E `global_bounds_case_membership` | 207.899 | 59.99 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 48ns | 1.80ms |
+| Q26 | A `n/a` | 134.375 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q26 | B `case` | 136.663 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q26 | C `partitioned_or` | 18.758 | 20.10 K | 58.30 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 48ns | 2.79ms |
+| Q26 | D `global` | 8.704 | 20.10 K | 58.30 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 48ns | 915.45µs |
+| Q26 | E `global_bounds_case_membership` | 8.402 | 20.10 K | 58.30 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 48ns | 650.10µs |
+| Q27 | A `n/a` | 145.684 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q27 | B `case` | 163.675 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 32ns | 32ns |
+| Q27 | C `partitioned_or` | 26.044 | 509.9 K | 921.5 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 48ns | 1.47ms |
+| Q27 | D `global` | 24.933 | 509.9 K | 921.5 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 48ns | 552.18µs |
+| Q27 | E `global_bounds_case_membership` | 25.352 | 509.9 K | 921.5 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 48ns | 522.28µs |
 
 #### `row_filter_only` mode
 
 | Query | Case | Warm ms | lineitem output_rows | pushdown_rows_pruned | pushdown_rows_matched | row_pushdown_eval_time | HashJoin input_rows |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Q24 | A `n/a` | 30.387 | 6.00 M | 0 | 0 | 32ns | 6.00 M |
-| Q24 | B `case` | 68.881 | 2.36 K | 6.00 M | 2.36 K | 502.53ms | 2.36 K |
-| Q24 | C `partitioned_or` | 92.312 | 2.36 K | 6.00 M | 2.36 K | 726.89ms | 2.36 K |
-| Q24 | D `global` | 27.541 | 2.36 K | 6.00 M | 2.36 K | 46.61ms | 2.36 K |
-| Q24 | E `global_bounds_case_membership` | 58.592 | 2.36 K | 6.00 M | 2.36 K | 454.89ms | 2.36 K |
-| Q25 | A `n/a` | 32.295 | 6.00 M | 0 | 0 | 32ns | 6.00 M |
-| Q25 | B `case` | 77.946 | 229.7 K | 5.77 M | 229.7 K | 535.58ms | 229.7 K |
-| Q25 | C `partitioned_or` | 114.891 | 229.7 K | 5.77 M | 229.7 K | 1.22s | 229.7 K |
-| Q25 | D `global` | 106.055 | 229.7 K | 5.77 M | 229.7 K | 1.02s | 229.7 K |
-| Q25 | E `global_bounds_case_membership` | 63.583 | 229.7 K | 5.77 M | 229.7 K | 507.51ms | 229.7 K |
-| Q26 | A `n/a` | 23.424 | 6.00 M | 0 | 0 | 32ns | 6.00 M |
-| Q26 | B `case` | 52.294 | 1.06 K | 6.00 M | 1.06 K | 429.22ms | 1.06 K |
-| Q26 | C `partitioned_or` | 32.095 | 1.06 K | 6.00 M | 1.06 K | 103.62ms | 1.06 K |
-| Q26 | D `global` | 19.001 | 1.06 K | 6.00 M | 1.06 K | 6.86ms | 1.06 K |
-| Q26 | E `global_bounds_case_membership` | 18.285 | 1.06 K | 6.00 M | 1.06 K | 7.82ms | 1.06 K |
-| Q27 | A `n/a` | 28.419 | 6.00 M | 0 | 0 | 32ns | 6.00 M |
-| Q27 | B `case` | 65.502 | 499.5 K | 5.50 M | 499.5 K | 443.40ms | 499.5 K |
-| Q27 | C `partitioned_or` | 87.211 | 499.5 K | 5.50 M | 499.5 K | 165.34ms | 499.5 K |
-| Q27 | D `global` | 79.177 | 499.5 K | 5.50 M | 499.5 K | 86.99ms | 499.5 K |
-| Q27 | E `global_bounds_case_membership` | 58.562 | 499.5 K | 5.50 M | 499.5 K | 54.01ms | 499.5 K |
+| Q24 | A `n/a` | 220.484 | 59.99 M | 0 | 0 | 32ns | 59.99 M |
+| Q24 | B `case` | 461.659 | 24.20 K | 59.96 M | 24.20 K | 4.55s | 24.20 K |
+| Q24 | C `partitioned_or` | 907.010 | 24.20 K | 59.96 M | 24.20 K | 11.67s | 24.20 K |
+| Q24 | D `global` | 809.177 | 24.20 K | 59.96 M | 24.20 K | 10.62s | 24.20 K |
+| Q24 | E `global_bounds_case_membership` | 419.129 | 24.20 K | 59.96 M | 24.20 K | 4.62s | 24.20 K |
+| Q25 | A `n/a` | 225.449 | 59.99 M | 0 | 0 | 32ns | 59.99 M |
+| Q25 | B `case` | 521.935 | 2.29 M | 57.69 M | 2.29 M | 4.96s | 2.29 M |
+| Q25 | C `partitioned_or` | 968.712 | 2.29 M | 57.69 M | 2.29 M | 13.07s | 2.29 M |
+| Q25 | D `global` | 898.191 | 2.29 M | 57.69 M | 2.29 M | 10.99s | 2.29 M |
+| Q25 | E `global_bounds_case_membership` | 493.396 | 2.29 M | 57.69 M | 2.29 M | 5.33s | 2.29 M |
+| Q26 | A `n/a` | 165.517 | 59.99 M | 0 | 0 | 32ns | 59.99 M |
+| Q26 | B `case` | 384.938 | 1.06 K | 59.98 M | 1.06 K | 3.74s | 1.06 K |
+| Q26 | C `partitioned_or` | 166.648 | 1.06 K | 59.98 M | 1.06 K | 969.94ms | 1.06 K |
+| Q26 | D `global` | 94.257 | 1.06 K | 59.98 M | 1.06 K | 78.90ms | 1.06 K |
+| Q26 | E `global_bounds_case_membership` | 97.480 | 1.06 K | 59.98 M | 1.06 K | 76.31ms | 1.06 K |
+| Q27 | A `n/a` | 179.292 | 59.99 M | 0 | 0 | 32ns | 59.99 M |
+| Q27 | B `case` | 429.653 | 499.5 K | 59.49 M | 499.5 K | 3.74s | 499.5 K |
+| Q27 | C `partitioned_or` | 241.047 | 499.5 K | 59.49 M | 499.5 K | 984.44ms | 499.5 K |
+| Q27 | D `global` | 182.233 | 499.5 K | 59.49 M | 499.5 K | 163.24ms | 499.5 K |
+| Q27 | E `global_bounds_case_membership` | 145.784 | 499.5 K | 59.49 M | 499.5 K | 120.07ms | 499.5 K |
 
 #### `full` mode
 
 | Query | Case | Warm ms | lineitem output_rows | bytes_scanned | row_groups_pruned_statistics | page_index_rows_pruned | pushdown_rows_pruned | row_pushdown_eval_time | statistics_eval_time |
 | --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
-| Q24 | A `n/a` | 38.638 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
-| Q24 | B `case` | 62.046 | 2.36 K | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 6.00 M | 444.95ms | 32ns |
-| Q24 | C `partitioned_or` | 96.083 | 2.36 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 5.98 M | 724.60ms | 15.31ms |
-| Q24 | D `global` | 30.391 | 2.36 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 5.98 M | 47.82ms | 12.72ms |
-| Q24 | E `global_bounds_case_membership` | 61.374 | 2.36 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 5.98 M matched | 5.98 M | 610.02ms | 10.83ms |
-| Q25 | A `n/a` | 45.261 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
-| Q25 | B `case` | 66.877 | 229.7 K | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 5.77 M | 523.91ms | 32ns |
-| Q25 | C `partitioned_or` | 122.726 | 229.7 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 5.77 M | 1.16s | 5.46ms |
-| Q25 | D `global` | 100.535 | 229.7 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 5.77 M | 1.23s | 5.70ms |
-| Q25 | E `global_bounds_case_membership` | 71.092 | 229.7 K | 10.41 M | 53 total → 53 matched | 6.00 M total → 6.00 M matched | 5.77 M | 502.03ms | 1.87ms |
-| Q26 | A `n/a` | 19.832 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
-| Q26 | B `case` | 45.611 | 1.06 K | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 6.00 M | 455.73ms | 32ns |
-| Q26 | C `partitioned_or` | 23.606 | 1.06 K | 113.5 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 19.03 K | 647.90µs | 3.89ms |
-| Q26 | D `global` | 8.690 | 1.06 K | 113.5 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 19.03 K | 80.38µs | 464.37µs |
-| Q26 | E `global_bounds_case_membership` | 8.766 | 1.06 K | 113.5 K | 53 total → 1 matched | 113.0 K total → 20.10 K matched | 19.03 K | 316.56µs | 460.82µs |
-| Q27 | A `n/a` | 25.920 | 6.00 M | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
-| Q27 | B `case` | 61.518 | 499.5 K | 10.41 M | 53 total → 53 matched | 0 total → 0 matched | 5.50 M | 482.68ms | 32ns |
-| Q27 | C `partitioned_or` | 83.972 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 88.21ms | 1.29ms |
-| Q27 | D `global` | 73.317 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 73.88ms | 462.35µs |
-| Q27 | E `global_bounds_case_membership` | 48.940 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 44.34ms | 423.28µs |
+| Q24 | A `n/a` | 208.501 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
+| Q24 | B `case` | 453.950 | 24.20 K | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 59.96 M | 4.58s | 32ns |
+| Q24 | C `partitioned_or` | 880.840 | 24.20 K | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 59.94 M | 11.26s | 6.34ms |
+| Q24 | D `global` | 835.290 | 24.20 K | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 59.94 M | 10.54s | 2.58ms |
+| Q24 | E `global_bounds_case_membership` | 426.193 | 24.20 K | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.97 M matched | 59.94 M | 4.69s | 2.83ms |
+| Q25 | A `n/a` | 232.169 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
+| Q25 | B `case` | 546.574 | 2.29 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 57.69 M | 5.36s | 32ns |
+| Q25 | C `partitioned_or` | 971.855 | 2.29 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 57.69 M | 12.08s | 6.64ms |
+| Q25 | D `global` | 911.401 | 2.29 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 57.69 M | 10.76s | 2.42ms |
+| Q25 | E `global_bounds_case_membership` | 474.788 | 2.29 M | 104.1 M | 524 total → 524 matched | 59.99 M total → 59.99 M matched | 57.69 M | 4.54s | 2.41ms |
+| Q26 | A `n/a` | 134.065 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
+| Q26 | B `case` | 329.371 | 1.06 K | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 59.98 M | 3.91s | 32ns |
+| Q26 | C `partitioned_or` | 21.677 | 1.06 K | 116.4 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 19.03 K | 682.22µs | 2.81ms |
+| Q26 | D `global` | 8.562 | 1.06 K | 116.4 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 19.03 K | 86.11µs | 978.88µs |
+| Q26 | E `global_bounds_case_membership` | 8.657 | 1.06 K | 116.4 K | 524 total → 1 matched | 114.2 K total → 20.10 K matched | 19.03 K | 482.67µs | 598.21µs |
+| Q27 | A `n/a` | 150.104 | 59.99 M | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 0 | 32ns | 32ns |
+| Q27 | B `case` | 360.386 | 499.5 K | 104.1 M | 524 total → 524 matched | 0 total → 0 matched | 59.49 M | 3.73s | 32ns |
+| Q27 | C `partitioned_or` | 113.766 | 499.5 K | 986.7 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 10.39 K | 90.88ms | 1.62ms |
+| Q27 | D `global` | 104.913 | 499.5 K | 986.7 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 10.39 K | 75.88ms | 369.69µs |
+| Q27 | E `global_bounds_case_membership` | 66.768 | 499.5 K | 986.7 K | 524 total → 6 matched | 686.3 K total → 509.9 K matched | 10.39 K | 41.74ms | 436.91µs |
