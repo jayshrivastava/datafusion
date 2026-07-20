@@ -1,30 +1,108 @@
 # Hash Join Dynamic Filter Expanded Matrix
 
-## Setup
+## Background
 
-- Branch: `js/benchmark-4-dynamic-filtering-alternatives`.
-- Data: `benchmarks/data/tpch_sf1`.
-- Runner: `target/release-nonlto/dfbench hj`; metrics from `target/release-nonlto/datafusion-cli` using `EXPLAIN ANALYZE VERBOSE`.
-- Iterations: 5 wall-time iterations per case; tables below use warm average, excluding the first iteration.
-- Partitioned hash join was forced with `hash_join_single_partition_threshold=0` and `hash_join_single_partition_threshold_rows=0`; join reordering was disabled.
-- Default target partitions on this host: 16.
+For `HashJoinExec mode=Partitioned`, we use `CASE` expressions to achieve partition-aware dynamic filtering.
+```
+CASE hash(expr) % num_partitions
+  WHEN 0 THEN filter_expr_for_partition_0
+  WHEN 1 THEN filter_expr_for_partition_1
+  WHEN 2 THEN filter_expr_for_partition_2
+   ...
+  ELSE false
+END
+```
 
-## Queries
+Note that typically each `filter_expr_for_partition` takes the form of a range expression + a set membership expression
+ex.
+```
+(some_min <= expr AND expr <= some_max)  AND expr in (some_set_of_keys)
+```
 
-- `Q24 date 1 day`: orders filtered to one day; dynamic filter values are spread across l_orderkey.
-- `Q25 date 92 days`: orders filtered to 92 days; much less selective.
-- `Q26 key 1K range`: orders filtered to a narrow o_orderkey range; best case for clustered l_orderkey pruning.
-- `Q27 key 500K range`: orders filtered to a wider o_orderkey range; range-friendly but less selective.
+Per partition `CASE`ing was added in https://github.com/apache/datafusion/pull/18451, but there are no benchmarks.
 
-## Modes
+The tradeoff being made is - the `CASE` expression is more expensive (hashing + case iteration) but
+it gives us more selective pruning. Is this trade off worth it?
+
+## Goal
+
+Determine the most performant representation for dynamic filters in partitioned hash joins. This benchmark compares 4
+alternatives:
+
+1. `case` - the current partition-aware expression:
+```text
+CASE hash(expr) % num_partitions
+  WHEN 0 THEN filter_expr_for_partition_0
+  WHEN 1 THEN filter_expr_for_partition_1
+  ...
+  ELSE false
+END
+```
+2. `partitioned_or` - `OR` the filter expression for each partition:
+```text
+filter_expr_for_partition_0 OR filter_expr_for_partition_1 OR filter_expr_for_partition_2 ...
+```
+3. `global` - construct one non-partition-aware expression representing all partitions. Typically:
+```
+(some_min <= expr AND expr <= some_max)  AND expr in (some_set_of_keys)
+```
+For larger build-side sets, the membership component may be a hash-table lookup rather than an `IN` list.
+4. `global_bounds_case_membership` - split the expression into global bounds and partition-aware membership:
+```text
+(global_min <= expr AND expr <= global_max)
+AND
+CASE hash(expr) % num_partitions
+  WHEN 0 THEN expr IN keys_for_partition_0
+  WHEN 1 THEN expr IN keys_for_partition_1
+  ...
+  ELSE false
+END
+```
+The idea is to let the cheap bounds expression evaluate first before having evaluate the expensive case expression.
+
+## Benchmark Specs
+
+Benchmark: `target/release-nonlto/dfbench hj`
+Data: `benchmarks/data/tpch_sf1`
+Iterations: 5
+
+Other notes:
+- Metrics: Captured via `target/release-nonlto/datafusion-cli` with `EXPLAIN ANALYZE VERBOSE`
+- We forced partitioned hash joins with no join reordering to isolate the partitioned hash joins we're interested in.
+```
+hash_join_single_partition_threshold=0
+hash_join_single_partition_threshold_rows=0
+datafusion.optimizer.join_reordering = false
+```
+
+## Benchmark Matrix
+
+3 session configs * 4 queries * 3 target_partitions * 5 dynamic filter expression types = 180 cases
+### Modes
 
 | Mode | Parquet settings | Purpose |
 | --- | --- | --- |
-| `default_metadata` | `pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true` | Current default behavior; metadata pruning can see any pruneable dynamic predicate, but no row-filter pushdown. |
-| `row_filter_only` | `pushdown_filters=true`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false` | Isolates row-filter expression CPU cost. |
-| `full` | `pushdown_filters=true`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true` | End-to-end row filter plus parquet pruning. |
+| `default_metadata` | `pushdown_filters=false`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true` | Current datafusion defaults. Parquet pruning: yes, row-filtering: no |
+| `row_filter_only` | `pushdown_filters=true`, `pruning=false`, `enable_page_index=false`, `bloom_filter_on_read=false` | Parquet pruning: no, row-filtering: yes |
+| `full` | `pushdown_filters=true`, `pruning=true`, `enable_page_index=true`, `bloom_filter_on_read=true` | Parquet pruning: yes, row-filtering: yes |
 
-## Cases
+
+### Queries
+
+- Ignored - `Q23` (selectivity=n/a, clustering=n/a): [PR #4](https://github.com/jayshrivastava/datafusion/pull/4) found this was not very relevant because its probe-side filter uses a computed string expression that cannot be used for parquet pruning.
+- `Q24 date 1 day` (selectivity=high, clustering=low): Dynamic filters should prune a lot of rows, but the resulting `l_orderkey` values are not clustered enough for useful row-group pruning.
+- `Q25 date 92 days` (selectivity=medium, clustering=low): Dynamic filters should prune fewer rows than Q24, and metadata pruning should still be weak because the surviving keys are spread across `l_orderkey`.
+- `Q26 key 1K range` (selectivity=high, clustering=high): Dynamic filters should prune a lot of rows, and the narrow clustered `l_orderkey` range should enable strong row-group/page pruning.
+- `Q27 key 500K range` (selectivity=medium, clustering=high): Dynamic filters should allow more rows through than Q26, while still testing whether a wider clustered key range benefits from row-group/page pruning.
+
+
+### Partition Counts
+
+- `4`
+- default target partitions on this host: `16`
+- `64`
+
+### Cases
 
 | Case | Dynamic filter | Style |
 | --- | --- | --- |
@@ -34,9 +112,12 @@
 | D | on | `global` |
 | E | on | `global_bounds_case_membership` |
 
-## Wall Time Warm Averages
+## Results
 
-Values are milliseconds, averaged across iterations 2-5.
+### Wall Time
+
+Values are milliseconds, averaged across warm iterations 2-5.
+Scores count row wins across each query table: each of the 9 rows contributes one win to the fastest expression type (A-E).
 
 | Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -50,6 +131,19 @@ Values are milliseconds, averaged across iterations 2-5.
 | Q24 | 64 | `row_filter_only` | 45.729 | 90.845 | 242.004 | 38.810 | 84.901 |
 | Q24 | 64 | `full` | 38.306 | 105.232 | 382.046 | 40.099 | 97.558 |
 
+Score (row wins):
+`A off`: 6
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 3
+`E bounds+case`: 0
+
+Score without A off (row wins):
+`B case`: 1
+`C partitioned_or`: 0
+`D global`: 7
+`E bounds+case`: 1
+
 | Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | Q25 | 4 | `default_metadata` | 54.740 | 55.748 | 59.245 | 55.857 | 55.573 |
@@ -61,6 +155,19 @@ Values are milliseconds, averaged across iterations 2-5.
 | Q25 | 64 | `default_metadata` | 38.538 | 39.552 | 60.244 | 48.357 | 39.563 |
 | Q25 | 64 | `row_filter_only` | 39.059 | 116.667 | 432.206 | 365.344 | 89.540 |
 | Q25 | 64 | `full` | 44.417 | 102.948 | 439.042 | 353.950 | 101.340 |
+
+Score (row wins):
+`A off`: 9
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 0
+`E bounds+case`: 0
+
+Score without A off (row wins):
+`B case`: 3
+`C partitioned_or`: 0
+`D global`: 1
+`E bounds+case`: 5
 
 | Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -74,6 +181,19 @@ Values are milliseconds, averaged across iterations 2-5.
 | Q26 | 64 | `row_filter_only` | 31.237 | 83.950 | 82.842 | 25.919 | 25.736 |
 | Q26 | 64 | `full` | 28.761 | 92.670 | 68.243 | 17.389 | 17.460 |
 
+Score (row wins):
+`A off`: 0
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 6
+`E bounds+case`: 3
+
+Score without A off (row wins):
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 6
+`E bounds+case`: 3
+
 | Query | Partitions | Mode | A off | B case | C partitioned_or | D global | E bounds+case |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | Q27 | 4 | `default_metadata` | 52.523 | 46.899 | 24.520 | 23.624 | 23.914 |
@@ -86,64 +206,98 @@ Values are milliseconds, averaged across iterations 2-5.
 | Q27 | 64 | `row_filter_only` | 38.924 | 86.831 | 122.313 | 81.717 | 42.856 |
 | Q27 | 64 | `full` | 39.519 | 88.041 | 114.784 | 83.150 | 38.942 |
 
-## Style Rankings
+Score (row wins):
+`A off`: 5
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 3
+`E bounds+case`: 1
 
-Each row ranks the four dynamic-filter styles by warm average across the three partition settings. Lower is better.
+Score without A off (row wins):
+`B case`: 0
+`C partitioned_or`: 0
+`D global`: 5
+`E bounds+case`: 4
 
-| Query | Mode | Rank | Style | Avg warm ms |
-| --- | --- | ---: | --- | ---: |
-| Q24 | `default_metadata` | 1 | `global` | 42.546 |
-| Q24 | `default_metadata` | 2 | `global_bounds_case_membership` | 43.284 |
-| Q24 | `default_metadata` | 3 | `case` | 44.499 |
-| Q24 | `default_metadata` | 4 | `partitioned_or` | 107.484 |
-| Q24 | `row_filter_only` | 1 | `global` | 47.415 |
-| Q24 | `row_filter_only` | 2 | `global_bounds_case_membership` | 81.922 |
-| Q24 | `row_filter_only` | 3 | `case` | 87.752 |
-| Q24 | `row_filter_only` | 4 | `partitioned_or` | 141.320 |
-| Q24 | `full` | 1 | `global` | 48.804 |
-| Q24 | `full` | 2 | `global_bounds_case_membership` | 87.393 |
-| Q24 | `full` | 3 | `case` | 90.346 |
-| Q24 | `full` | 4 | `partitioned_or` | 190.151 |
-| Q25 | `default_metadata` | 1 | `global_bounds_case_membership` | 42.343 |
-| Q25 | `default_metadata` | 2 | `case` | 43.914 |
-| Q25 | `default_metadata` | 3 | `global` | 45.192 |
-| Q25 | `default_metadata` | 4 | `partitioned_or` | 50.716 |
-| Q25 | `row_filter_only` | 1 | `global_bounds_case_membership` | 91.283 |
-| Q25 | `row_filter_only` | 2 | `case` | 107.136 |
-| Q25 | `row_filter_only` | 3 | `global` | 198.408 |
-| Q25 | `row_filter_only` | 4 | `partitioned_or` | 225.440 |
-| Q25 | `full` | 1 | `case` | 97.212 |
-| Q25 | `full` | 2 | `global_bounds_case_membership` | 98.248 |
-| Q25 | `full` | 3 | `global` | 192.795 |
-| Q25 | `full` | 4 | `partitioned_or` | 232.197 |
-| Q26 | `default_metadata` | 1 | `global` | 11.129 |
-| Q26 | `default_metadata` | 2 | `global_bounds_case_membership` | 11.429 |
-| Q26 | `default_metadata` | 3 | `case` | 30.997 |
-| Q26 | `default_metadata` | 4 | `partitioned_or` | 31.650 |
-| Q26 | `row_filter_only` | 1 | `global` | 25.604 |
-| Q26 | `row_filter_only` | 2 | `global_bounds_case_membership` | 25.692 |
-| Q26 | `row_filter_only` | 3 | `partitioned_or` | 49.960 |
-| Q26 | `row_filter_only` | 4 | `case` | 72.700 |
-| Q26 | `full` | 1 | `global` | 10.989 |
-| Q26 | `full` | 2 | `global_bounds_case_membership` | 11.064 |
-| Q26 | `full` | 3 | `partitioned_or` | 33.135 |
-| Q26 | `full` | 4 | `case` | 70.263 |
-| Q27 | `default_metadata` | 1 | `global` | 21.394 |
-| Q27 | `default_metadata` | 2 | `global_bounds_case_membership` | 21.995 |
-| Q27 | `default_metadata` | 3 | `partitioned_or` | 27.562 |
-| Q27 | `default_metadata` | 4 | `case` | 38.757 |
-| Q27 | `row_filter_only` | 1 | `global_bounds_case_membership` | 56.905 |
-| Q27 | `row_filter_only` | 2 | `global` | 76.239 |
-| Q27 | `row_filter_only` | 3 | `case` | 86.202 |
-| Q27 | `row_filter_only` | 4 | `partitioned_or` | 94.345 |
-| Q27 | `full` | 1 | `global_bounds_case_membership` | 47.024 |
-| Q27 | `full` | 2 | `global` | 69.741 |
-| Q27 | `full` | 3 | `case` | 82.432 |
-| Q27 | `full` | 4 | `partitioned_or` | 86.275 |
+## Short Analysis
 
-## Default Metadata Pruning Metrics
+- `global` is the most consistently strong dynamic-filter shape in this run. It is the best dynamic style for Q24 in all modes, best for Q26, and close on Q27 default/metadata mode. Its advantage is that it creates one ordinary global predicate, so parquet pruning and row filtering do not have to route through a partition CASE and do not have to evaluate a large OR tree.
+- `global_bounds_case_membership` is best on wider ranges where global bounds are useful but preserving partition-routed membership still avoids too many false positives. It is the best dynamic style for Q25 default/metadata and Q27 row-filter/full mode, but it still pays CASE routing for membership.
+- Dynamic filtering is not automatically a win. On date-based Q25, the dynamic-off baseline is faster than every dynamic-filter style in the full/default-partition run because row-group pruning does not improve and row filtering adds CPU. The strongest wins are on clustered key-range queries Q26/Q27, where non-CASE dynamic predicates unlock row-group and page pruning.
+- `case` is usually worse when `pushdown_filters=true`; the row-filter-only table shows the cost directly. `CaseExpr` evaluates the partition expression once, then iterates `WHEN` branches over remaining rows and evaluates only matching `THEN` predicates. It is not all predicates for all rows, but it is still CPU-heavy as partition count rises and it hides useful predicates from parquet pruning.
+- `partitioned_or` is the weakest overall. It removes CASE routing, but it expands to an OR of per-partition predicates. At 64 partitions that large expression is expensive, and in several cases it is slower than both `global` and `global_bounds_case_membership`.
+- Row-group pruning matters a lot only for the clustered key-range queries. Q26 full/default with `global` scans roughly one lineitem row group (`row_groups_pruned_statistics=53 total -> 1 matched`, `bytes_scanned=113.5 K`), while `case` keeps all row groups alive. For the date-based Q24/Q25 queries, dynamic values are spread across order keys, so row-group pruning is much less helpful.
+- Removing CASE can lose partition-local selectivity: global and OR-style filters can admit rows matching another partition's predicate. The results here suggest that for clustered range-friendly keys, the pruning and CPU wins dominate that loss. For wider/non-clustered filters, the hybrid `global_bounds_case_membership` can be a better compromise.
 
-Default partition count, `default_metadata` mode (`pushdown_filters=false`). This is closest to current defaults and shows what parquet metadata pruning can do without row-filter pushdown.
+## Appendix
+
+### Queries
+
+#### Q24
+
+```sql
+SELECT count(*)
+FROM (
+  SELECT o_orderkey AS k
+  FROM orders
+  WHERE o_orderdate >= DATE '1993-07-01'
+    AND o_orderdate < DATE '1993-07-02'
+) o
+JOIN (
+  SELECT l_orderkey AS k
+  FROM lineitem
+) l ON o.k = l.k
+```
+
+#### Q25
+
+```sql
+SELECT count(*)
+FROM (
+  SELECT o_orderkey AS k
+  FROM orders
+  WHERE o_orderdate >= DATE '1993-07-01'
+    AND o_orderdate < DATE '1993-10-01'
+) o
+JOIN (
+  SELECT l_orderkey AS k
+  FROM lineitem
+) l ON o.k = l.k
+```
+
+#### Q26
+
+```sql
+SELECT count(*)
+FROM (
+  SELECT o_orderkey AS k
+  FROM orders
+  WHERE o_orderkey BETWEEN 1000000 AND 1001000
+) o
+JOIN (
+  SELECT l_orderkey AS k
+  FROM lineitem
+) l ON o.k = l.k
+```
+
+#### Q27
+
+```sql
+SELECT count(*)
+FROM (
+  SELECT o_orderkey AS k
+  FROM orders
+  WHERE o_orderkey BETWEEN 1000000 AND 1500000
+) o
+JOIN (
+  SELECT l_orderkey AS k
+  FROM lineitem
+) l ON o.k = l.k
+```
+
+### Metrics
+
+#### `default_metadata` mode
 
 | Query | Case | Warm ms | lineitem output_rows | bytes_scanned | row_groups_pruned_statistics | page_index_rows_pruned | row_pushdown_eval_time | statistics_eval_time |
 | --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: |
@@ -168,9 +322,7 @@ Default partition count, `default_metadata` mode (`pushdown_filters=false`). Thi
 | Q27 | D `global` | 17.839 | 524.7 K | 941.1 K | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 48ns | 442.28µs |
 | Q27 | E `global_bounds_case_membership` | 18.720 | 524.7 K | 941.1 K | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 48ns | 373.70µs |
 
-## Row Filter CPU Metrics
-
-Default partition count, `row_filter_only` mode. These metrics isolate row-filter expression cost on the lineitem scan.
+#### `row_filter_only` mode
 
 | Query | Case | Warm ms | lineitem output_rows | pushdown_rows_pruned | pushdown_rows_matched | row_pushdown_eval_time | HashJoin input_rows |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -195,9 +347,7 @@ Default partition count, `row_filter_only` mode. These metrics isolate row-filte
 | Q27 | D `global` | 79.177 | 499.5 K | 5.50 M | 499.5 K | 86.99ms | 499.5 K |
 | Q27 | E `global_bounds_case_membership` | 58.562 | 499.5 K | 5.50 M | 499.5 K | 54.01ms | 499.5 K |
 
-## Full Mode Pruning Metrics
-
-Default partition count, `full` mode. These show whether a style exposes a useful predicate to parquet metadata pruning and row filtering on lineitem.
+#### `full` mode
 
 | Query | Case | Warm ms | lineitem output_rows | bytes_scanned | row_groups_pruned_statistics | page_index_rows_pruned | pushdown_rows_pruned | row_pushdown_eval_time | statistics_eval_time |
 | --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
@@ -221,77 +371,3 @@ Default partition count, `full` mode. These show whether a style exposes a usefu
 | Q27 | C `partitioned_or` | 83.972 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 88.21ms | 1.29ms |
 | Q27 | D `global` | 73.317 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 73.88ms | 462.35µs |
 | Q27 | E `global_bounds_case_membership` | 48.940 | 499.5 K | 1.01 M | 53 total → 6 matched | 678.6 K total → 524.7 K matched | 25.19 K | 44.34ms | 423.28µs |
-
-## Short Analysis
-
-- `global` is the most consistently strong dynamic-filter shape in this run. It is the best dynamic style for Q24 in all modes, best for Q26, and close on Q27 default/metadata mode. Its advantage is that it creates one ordinary global predicate, so parquet pruning and row filtering do not have to route through a partition CASE and do not have to evaluate a large OR tree.
-- `global_bounds_case_membership` is best on wider ranges where global bounds are useful but preserving partition-routed membership still avoids too many false positives. It is the best dynamic style for Q25 default/metadata and Q27 row-filter/full mode, but it still pays CASE routing for membership.
-- Dynamic filtering is not automatically a win. On date-based Q25, the dynamic-off baseline is faster than every dynamic-filter style in the full/default-partition run because row-group pruning does not improve and row filtering adds CPU. The strongest wins are on clustered key-range queries Q26/Q27, where non-CASE dynamic predicates unlock row-group and page pruning.
-- `case` is usually worse when `pushdown_filters=true`; the row-filter-only table shows the cost directly. `CaseExpr` evaluates the partition expression once, then iterates `WHEN` branches over remaining rows and evaluates only matching `THEN` predicates. It is not all predicates for all rows, but it is still CPU-heavy as partition count rises and it hides useful predicates from parquet pruning.
-- `partitioned_or` is the weakest overall. It removes CASE routing, but it expands to an OR of per-partition predicates. At 64 partitions that large expression is expensive, and in several cases it is slower than both `global` and `global_bounds_case_membership`.
-- Row-group pruning matters a lot only for the clustered key-range queries. Q26 full/default with `global` scans roughly one lineitem row group (`row_groups_pruned_statistics=53 total -> 1 matched`, `bytes_scanned=113.5 K`), while `case` keeps all row groups alive. For the date-based Q24/Q25 queries, dynamic values are spread across order keys, so row-group pruning is much less helpful.
-- Removing CASE can lose partition-local selectivity: global and OR-style filters can admit rows matching another partition's predicate. The results here suggest that for clustered range-friendly keys, the pruning and CPU wins dominate that loss. For wider/non-clustered filters, the hybrid `global_bounds_case_membership` can be a better compromise.
-
-## Query Text
-
-### Q24
-
-```sql
-SELECT count(*)
-FROM (
-  SELECT o_orderkey AS k
-  FROM orders
-  WHERE o_orderdate >= DATE '1993-07-01'
-    AND o_orderdate < DATE '1993-07-02'
-) o
-JOIN (
-  SELECT l_orderkey AS k
-  FROM lineitem
-) l ON o.k = l.k
-```
-
-### Q25
-
-```sql
-SELECT count(*)
-FROM (
-  SELECT o_orderkey AS k
-  FROM orders
-  WHERE o_orderdate >= DATE '1993-07-01'
-    AND o_orderdate < DATE '1993-10-01'
-) o
-JOIN (
-  SELECT l_orderkey AS k
-  FROM lineitem
-) l ON o.k = l.k
-```
-
-### Q26
-
-```sql
-SELECT count(*)
-FROM (
-  SELECT o_orderkey AS k
-  FROM orders
-  WHERE o_orderkey BETWEEN 1000000 AND 1001000
-) o
-JOIN (
-  SELECT l_orderkey AS k
-  FROM lineitem
-) l ON o.k = l.k
-```
-
-### Q27
-
-```sql
-SELECT count(*)
-FROM (
-  SELECT o_orderkey AS k
-  FROM orders
-  WHERE o_orderkey BETWEEN 1000000 AND 1500000
-) o
-JOIN (
-  SELECT l_orderkey AS k
-  FROM lineitem
-) l ON o.k = l.k
-```
