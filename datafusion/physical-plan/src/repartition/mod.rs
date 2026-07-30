@@ -1187,17 +1187,12 @@ impl ExecutionPlan for RepartitionExec {
 
     fn apply_expressions(
         &self,
-        f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        // Apply to hash partition expressions if this is a hash repartition
-        if let Partitioning::Hash(exprs, _) = self.partitioning() {
-            let mut tnr = TreeNodeRecursion::Continue;
-            for expr in exprs {
-                tnr = tnr.visit_sibling(|| f(expr.as_ref()))?;
-            }
-            return Ok(tnr);
+        match self.partitioning() {
+            Partitioning::Hash(exprs, _) => crate::apply_expression_roots(exprs, f),
+            _ => Ok(TreeNodeRecursion::Continue),
         }
-        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

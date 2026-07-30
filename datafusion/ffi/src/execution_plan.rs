@@ -33,6 +33,7 @@ use tokio::runtime::Handle;
 
 use crate::config::FFI_ConfigOptions;
 use crate::execution::FFI_TaskContext;
+use crate::physical_expr::FFI_PhysicalExpr;
 use crate::physical_expr::metrics::FFI_MetricsSet;
 use crate::plan_properties::FFI_PlanProperties;
 use crate::record_batch_stream::FFI_RecordBatchStream;
@@ -49,6 +50,10 @@ pub struct FFI_ExecutionPlan {
 
     /// Return a vector of children plans
     pub children: unsafe extern "C" fn(plan: &Self) -> SVec<FFI_ExecutionPlan>,
+
+    /// Return the physical expression roots owned by this plan node.
+    pub apply_expressions:
+        unsafe extern "C" fn(plan: &Self) -> FFI_Result<SVec<FFI_PhysicalExpr>>,
 
     pub with_new_children:
         unsafe extern "C" fn(plan: &Self, children: SVec<Self>) -> FFI_Result<Self>,
@@ -90,6 +95,9 @@ pub struct FFI_ExecutionPlan {
 
     /// Release the memory of the private data when it is no longer being used.
     pub release: unsafe extern "C" fn(arg: &mut Self),
+
+    /// Return the major DataFusion version number of this provider.
+    pub version: unsafe extern "C" fn() -> u64,
 
     /// Internal data. This is only to be accessed by the provider of the plan.
     /// A [`ForeignExecutionPlan`] should never attempt to access this data.
@@ -136,6 +144,17 @@ unsafe extern "C" fn children_fn_wrapper(
         .into_iter()
         .map(|child| FFI_ExecutionPlan::new(Arc::clone(child), runtime.clone()))
         .collect()
+}
+
+unsafe extern "C" fn apply_expressions_fn_wrapper(
+    plan: &FFI_ExecutionPlan,
+) -> FFI_Result<SVec<FFI_PhysicalExpr>> {
+    let mut expressions = SVec::new();
+    let result = plan.inner().apply_expressions(&mut |expr| {
+        expressions.push(FFI_PhysicalExpr::from(Arc::clone(expr)));
+        Ok(TreeNodeRecursion::Continue)
+    });
+    sresult!(result.map(|_| expressions))
 }
 
 unsafe extern "C" fn with_new_children_fn_wrapper(
@@ -303,6 +322,7 @@ impl FFI_ExecutionPlan {
         Self {
             properties: properties_fn_wrapper,
             children: children_fn_wrapper,
+            apply_expressions: apply_expressions_fn_wrapper,
             with_new_children: with_new_children_fn_wrapper,
             name: name_fn_wrapper,
             execute: execute_fn_wrapper,
@@ -311,6 +331,7 @@ impl FFI_ExecutionPlan {
             partition_statistics: partition_statistics_fn_wrapper,
             clone: clone_fn_wrapper,
             release: release_fn_wrapper,
+            version: crate::version,
             private_data: Box::into_raw(private_data) as *mut c_void,
             library_marker_id: crate::get_library_marker_id,
         }
@@ -442,17 +463,19 @@ impl ExecutionPlan for ForeignExecutionPlan {
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(
-            &dyn datafusion_physical_plan::PhysicalExpr,
+            &Arc<dyn datafusion_physical_plan::PhysicalExpr>,
         ) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        // Visit expressions in the output ordering from equivalence properties
-        let mut tnr = TreeNodeRecursion::Continue;
-        if let Some(ordering) = self.properties.output_ordering() {
-            for sort_expr in ordering {
-                tnr = tnr.visit_sibling(|| f(sort_expr.expr.as_ref()))?;
-            }
-        }
-        Ok(tnr)
+        let expressions =
+            df_result!(unsafe { (self.plan.apply_expressions)(&self.plan) })?;
+        datafusion_physical_plan::apply_expression_roots(
+            expressions.iter().map(|expression| {
+                let expression: Arc<dyn datafusion_physical_plan::PhysicalExpr> =
+                    expression.into();
+                expression
+            }),
+            f,
+        )
     }
 
     fn repartitioned(
@@ -487,8 +510,8 @@ impl ExecutionPlan for ForeignExecutionPlan {
 
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod tests {
-    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion_physical_plan::{Partitioning, PhysicalExpr};
 
     use super::*;
 
@@ -496,6 +519,7 @@ pub mod tests {
     pub struct EmptyExec {
         props: Arc<PlanProperties>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        expressions: Vec<Arc<dyn PhysicalExpr>>,
         metrics: Option<MetricsSet>,
         statistics: Option<Statistics>,
     }
@@ -510,6 +534,7 @@ pub mod tests {
                     Boundedness::Bounded,
                 )),
                 children: Vec::default(),
+                expressions: Vec::default(),
                 metrics: None,
                 statistics: None,
             }
@@ -522,6 +547,14 @@ pub mod tests {
 
         pub fn with_statistics(mut self, statistics: Statistics) -> Self {
             self.statistics = Some(statistics);
+            self
+        }
+
+        pub fn with_expressions(
+            mut self,
+            expressions: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Self {
+            self.expressions = expressions;
             self
         }
     }
@@ -556,6 +589,7 @@ pub mod tests {
             Ok(Arc::new(EmptyExec {
                 props: Arc::clone(&self.props),
                 children,
+                expressions: self.expressions.clone(),
                 metrics: self.metrics.clone(),
                 statistics: self.statistics.clone(),
             }))
@@ -584,18 +618,9 @@ pub mod tests {
 
         fn apply_expressions(
             &self,
-            f: &mut dyn FnMut(
-                &dyn datafusion_physical_plan::PhysicalExpr,
-            ) -> Result<TreeNodeRecursion>,
+            f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
         ) -> Result<TreeNodeRecursion> {
-            // Visit expressions in the output ordering from equivalence properties
-            let mut tnr = TreeNodeRecursion::Continue;
-            if let Some(ordering) = self.props.output_ordering() {
-                for sort_expr in ordering {
-                    tnr = tnr.visit_sibling(|| f(sort_expr.expr.as_ref()))?;
-                }
-            }
-            Ok(tnr)
+            datafusion_physical_plan::apply_expression_roots(&self.expressions, f)
         }
     }
 
@@ -625,6 +650,38 @@ pub mod tests {
             "FFI_ExecutionPlan: empty-exec, number_of_children=0"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_ffi_execution_plan_apply_expressions() -> Result<()> {
+        use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
+        let expected_id = dynamic_filter
+            .expression_id()
+            .expect("dynamic filters always have an expression ID");
+        let expression: Arc<dyn PhysicalExpr> =
+            Arc::<DynamicFilterPhysicalExpr>::clone(&dynamic_filter);
+        let original_plan =
+            Arc::new(EmptyExec::new(schema).with_expressions(vec![expression]));
+
+        let mut ffi_plan = FFI_ExecutionPlan::new(original_plan, None);
+        ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
+        let foreign_plan: Arc<dyn ExecutionPlan> = (&ffi_plan).try_into()?;
+
+        let mut retained = None;
+        foreign_plan.apply_expressions(&mut |expr| {
+            retained = Some(Arc::clone(expr));
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        drop(foreign_plan);
+
+        assert_eq!(
+            retained.and_then(|expr| expr.expression_id()),
+            Some(expected_id)
+        );
         Ok(())
     }
 
