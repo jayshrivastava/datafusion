@@ -301,13 +301,12 @@ impl ExecutionPlan for OutputRequirementExec {
             &Arc<dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr>,
         ) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        let distribution = if let Distribution::HashPartitioned(exprs) =
-            &self.dist_requirement
-        {
-            exprs.as_slice()
-        } else {
-            &[]
-        };
+        let distribution =
+            if let Distribution::HashPartitioned(exprs) = &self.dist_requirement {
+                exprs.as_slice()
+            } else {
+                &[]
+            };
         let ordering = self
             .order_requirement
             .iter()

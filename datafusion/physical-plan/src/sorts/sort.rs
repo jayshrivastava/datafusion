@@ -1151,6 +1151,13 @@ impl ExecutionPlan for SortExec {
         vec![&self.input]
     }
 
+    fn dynamic_expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.dynamic_filter_expr()
+            .into_iter()
+            .map(|expr| expr as Arc<dyn PhysicalExpr>)
+            .collect()
+    }
+
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -2768,6 +2775,9 @@ mod tests {
             .expect("should have dynamic filter with fetch")
             .expression_id()
             .expect("DynamicFilterPhysicalExpr always has an expression_id");
+        let produced = sort.dynamic_expressions();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].expression_id(), Some(original_id));
 
         // with_dynamic_filter replaces it with a new TopKDynamicFilters.
         let new_df = Arc::new(DynamicFilterPhysicalExpr::new(
@@ -2785,6 +2795,9 @@ mod tests {
             .expect("DynamicFilterPhysicalExpr always has an expression_id");
         assert_eq!(restored_id, new_id);
         assert_ne!(restored_id, original_id);
+        let produced = sort.dynamic_expressions();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].expression_id(), Some(new_id));
         Ok(())
     }
 

@@ -1251,6 +1251,16 @@ impl ExecutionPlan for HashJoinExec {
         vec![&self.left, &self.right]
     }
 
+    fn dynamic_expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.dynamic_filter
+            .iter()
+            .map(|dynamic_filter| {
+                Arc::<DynamicFilterPhysicalExpr>::clone(&dynamic_filter.filter)
+                    as Arc<dyn PhysicalExpr>
+            })
+            .collect()
+    }
+
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -6346,6 +6356,7 @@ mod tests {
             false,
         )?;
         assert!(join.dynamic_filter_expr().is_none());
+        assert!(join.dynamic_expressions().is_empty());
 
         let df = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![Arc::new(Column::new("b1", 1)) as _],
@@ -6363,6 +6374,9 @@ mod tests {
             df.expression_id()
                 .expect("DynamicFilterPhysicalExpr always has an expression_id"),
         );
+        let produced = join.dynamic_expressions();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].expression_id(), df.expression_id());
         Ok(())
     }
 
