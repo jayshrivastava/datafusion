@@ -979,6 +979,10 @@ impl SortExec {
     }
 
     /// Returns the dynamic filter expression for this sort (TopK), if set.
+    #[deprecated(
+        since = "55.0.0",
+        note = "Use ExecutionPlan::dynamic_expressions_produced instead"
+    )]
     pub fn dynamic_filter_expr(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
         self.filter.as_ref().map(|f| f.read().expr())
     }
@@ -1151,10 +1155,10 @@ impl ExecutionPlan for SortExec {
         vec![&self.input]
     }
 
-    fn dynamic_expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        self.dynamic_filter_expr()
-            .into_iter()
-            .map(|expr| expr as Arc<dyn PhysicalExpr>)
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.filter
+            .iter()
+            .map(|filter| filter.read().expr() as Arc<dyn PhysicalExpr>)
             .collect()
     }
 
@@ -2770,14 +2774,11 @@ mod tests {
         .with_fetch(Some(10));
 
         // SortExec with fetch creates a dynamic filter automatically.
-        let original_id = sort
-            .dynamic_filter_expr()
-            .expect("should have dynamic filter with fetch")
+        let produced = sort.dynamic_expressions_produced();
+        assert_eq!(produced.len(), 1);
+        let original_id = produced[0]
             .expression_id()
             .expect("DynamicFilterPhysicalExpr always has an expression_id");
-        let produced = sort.dynamic_expressions();
-        assert_eq!(produced.len(), 1);
-        assert_eq!(produced[0].expression_id(), Some(original_id));
 
         // with_dynamic_filter replaces it with a new TopKDynamicFilters.
         let new_df = Arc::new(DynamicFilterPhysicalExpr::new(
@@ -2788,16 +2789,13 @@ mod tests {
             .expression_id()
             .expect("DynamicFilterPhysicalExpr always has an expression_id");
         let sort = sort.with_dynamic_filter_expr(Arc::clone(&new_df))?;
-        let restored_id = sort
-            .dynamic_filter_expr()
-            .expect("should still have dynamic filter")
+        let produced = sort.dynamic_expressions_produced();
+        assert_eq!(produced.len(), 1);
+        let restored_id = produced[0]
             .expression_id()
             .expect("DynamicFilterPhysicalExpr always has an expression_id");
         assert_eq!(restored_id, new_id);
         assert_ne!(restored_id, original_id);
-        let produced = sort.dynamic_expressions();
-        assert_eq!(produced.len(), 1);
-        assert_eq!(produced[0].expression_id(), Some(new_id));
         Ok(())
     }
 

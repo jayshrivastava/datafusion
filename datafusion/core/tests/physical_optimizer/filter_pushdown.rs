@@ -2848,9 +2848,15 @@ fn test_hashjoin_dynamic_filter_pushdown_is_used() {
         let hash_join = plan
             .downcast_ref::<HashJoinExec>()
             .expect("Plan should be HashJoinExec");
-        let expression_id = hash_join
-            .dynamic_filter_expr()
-            .expect("Dynamic filter should be created")
+        let dynamic_filter = hash_join
+            .dynamic_expressions_produced()
+            .into_iter()
+            .next()
+            .expect("Dynamic filter should be created");
+        let dynamic_filter = (dynamic_filter as Arc<dyn std::any::Any + Send + Sync>)
+            .downcast::<DynamicFilterPhysicalExpr>()
+            .expect("produced expression should be a DynamicFilterPhysicalExpr");
+        let expression_id = dynamic_filter
             .expression_id()
             .expect("Dynamic filters always have an expression ID");
 
@@ -3060,7 +3066,7 @@ fn test_discover_dynamic_expression_producers() {
     fn producer_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
         let mut count = 0;
         plan.apply(|node| {
-            count += node.dynamic_expressions().len();
+            count += node.dynamic_expressions_produced().len();
             Ok(TreeNodeRecursion::Continue)
         })
         .expect("plan traversal should succeed");
