@@ -664,6 +664,10 @@ pub mod tests {
         }
     }
 
+    pub(crate) fn create_dynamic_filter() -> Arc<DynamicFilterPhysicalExpr> {
+        Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)))
+    }
+
     #[test]
     fn test_round_trip_ffi_execution_plan() -> Result<()> {
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -728,7 +732,7 @@ pub mod tests {
     #[test]
     fn test_ffi_execution_plan_dynamic_expressions_produced() -> Result<()> {
         let schema = Arc::new(arrow::datatypes::Schema::empty());
-        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
+        let dynamic_filter = create_dynamic_filter();
         let expected_id = dynamic_filter
             .expression_id()
             .expect("dynamic filters always have an expression ID");
