@@ -30,6 +30,7 @@ use datafusion_common::{ColumnStatistics, Statistics};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_plan::ExecutionPlan;
 use sync_provider::create_sync_table_provider;
 use udf_udaf_udwf::{

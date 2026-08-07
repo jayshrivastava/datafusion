@@ -455,12 +455,6 @@ unsafe extern "C" fn clone_fn_wrapper(expr: &FFI_PhysicalExpr) -> FFI_PhysicalEx
     }
 }
 
-unsafe extern "C" fn expression_id_fn_wrapper(
-    expr: &FFI_PhysicalExpr,
-) -> FFI_Option<u64> {
-    expr.inner().expression_id().into()
-}
-
 impl Drop for FFI_PhysicalExpr {
     fn drop(&mut self) {
         unsafe { (self.release)(self) }

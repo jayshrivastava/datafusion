@@ -3839,8 +3839,8 @@ fn test_aggregate_without_dynamic_filter_roundtrip() -> Result<()> {
     assert!(
         plan.downcast_ref::<AggregateExec>()
             .expect("Should be AggregateExec")
-            .dynamic_filter_expr()
-            .is_none()
+            .dynamic_expressions_produced()
+            .is_empty()
     );
 
     let ctx = SessionContext::new();
@@ -3858,8 +3858,8 @@ fn test_aggregate_without_dynamic_filter_roundtrip() -> Result<()> {
         deserialized
             .downcast_ref::<AggregateExec>()
             .expect("Should be AggregateExec")
-            .dynamic_filter_expr()
-            .is_none()
+            .dynamic_expressions_produced()
+            .is_empty()
     );
     Ok(())
 }

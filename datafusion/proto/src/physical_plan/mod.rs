@@ -2584,12 +2584,10 @@ impl protobuf::PhysicalPlanNode {
         };
 
         let dynamic_filter = exec
-            .dynamic_filter_expr()
-            .map(|df| {
-                let df_expr: Arc<dyn PhysicalExpr> =
-                    Arc::clone(df) as Arc<dyn PhysicalExpr>;
-                proto_converter.physical_expr_to_proto(&df_expr, codec)
-            })
+            .dynamic_expressions_produced()
+            .into_iter()
+            .next()
+            .map(|expr| proto_converter.physical_expr_to_proto(&expr, codec))
             .transpose()?;
 
         Ok(protobuf::PhysicalPlanNode {
@@ -2937,12 +2935,10 @@ impl protobuf::PhysicalPlanNode {
                     limit,
                     has_grouping_set: exec.group_expr().has_grouping_set(),
                     dynamic_filter: exec
-                        .dynamic_filter_expr()
-                        .map(|df| {
-                            let df_expr: Arc<dyn PhysicalExpr> =
-                                Arc::clone(df) as Arc<dyn PhysicalExpr>;
-                            proto_converter.physical_expr_to_proto(&df_expr, codec)
-                        })
+                        .dynamic_expressions_produced()
+                        .into_iter()
+                        .next()
+                        .map(|expr| proto_converter.physical_expr_to_proto(&expr, codec))
                         .transpose()?,
                 },
             ))),
@@ -3238,11 +3234,10 @@ impl protobuf::PhysicalPlanNode {
             })
             .collect::<Result<Vec<_>>>()?;
         let dynamic_filter = exec
-            .dynamic_filter_expr()
-            .map(|df| {
-                let df_expr: Arc<dyn PhysicalExpr> = df as Arc<dyn PhysicalExpr>;
-                proto_converter.physical_expr_to_proto(&df_expr, codec)
-            })
+            .dynamic_expressions_produced()
+            .into_iter()
+            .next()
+            .map(|expr| proto_converter.physical_expr_to_proto(&expr, codec))
             .transpose()?;
 
         Ok(protobuf::PhysicalPlanNode {
