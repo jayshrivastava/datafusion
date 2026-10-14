@@ -18,20 +18,20 @@
 //! Benchmark for `preserve_file_partitions` optimization.
 //!
 //! When enabled, this optimization declares Hive-partitioned tables as
-//! `Hash([partition_col])` partitioned, allowing the query optimizer to
-//! skip unnecessary repartitioning and sorting operations.
+//! `Range` partitioned using the grouped values as boundaries, allowing the query
+//! optimizer to skip unnecessary repartitioning and sorting operations.
 //!
 //! When This Optimization Helps
 //! - Window functions: PARTITION BY on partition column eliminates RepartitionExec and SortExec
 //! - Aggregates with ORDER BY: GROUP BY partition column and ORDER BY eliminates post aggregate sort
 //!
 //! When This Optimization Does NOT Help
-//! - GROUP BY non-partition columns: Required Hash distribution doesn't match declared partitioning
+//! - GROUP BY non-partition columns: Required key distribution doesn't match declared partitioning
 //! - When the number of distinct file partitioning groups < the number of CPUs available: Reduces
 //!   parallelization, thus may outweigh the pros of reduced shuffles
 //!
 //! Usage
-//! - BENCH_SIZE=small|medium|large cargo bench -p datafusion --bench preserve_file_partitions
+//! - BENCH_SIZE=small|medium|large cargo bench -p datafusion --bench preserve_file_partitioning
 //! - SAVE_PLANS=1 cargo bench ...  # Save query plans to files
 
 use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampMillisecondArray};
@@ -433,7 +433,7 @@ fn run_benchmark(
 /// │   └─────────────┬─────────────┘                                                                         │
 /// │                 │                                                                                       │
 /// │   ┌─────────────▼─────────────┐                                                                         │
-/// │   │     DataSourceExec        │ partitioning=Hash([f_dkey])                                             │
+/// │   │     DataSourceExec        │ partitioning=Range([f_dkey ASC], ...)                                   │
 /// │   │   file_groups={N groups}  │                                                                         │
 /// │   └───────────────────────────┘                                                                         │
 /// └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -538,19 +538,19 @@ fn preserve_order_bench(
 /// │   └─────────────┬─────────────┘                                                                         │
 /// │                 │                                                                                       │
 /// │   ┌─────────────▼─────────────┐                                                                         │
-/// │   │      AggregateExec        │ Hash partitioning propagates through join                               │
+/// │   │      AggregateExec        │ Range partitioning propagates through join                              │
 /// │   │    (SinglePartitioned)    │                                                                         │
 /// │   └─────────────┬─────────────┘                                                                         │
 /// │                 │                                                                                       │
 /// │   ┌─────────────▼─────────────┐                                                                         │
-/// │   │      HashJoinExec         │ Hash partitioning preserved on probe side                               │
+/// │   │      HashJoinExec         │ Range partitioning preserved on probe side                              │
 /// │   │     (CollectLeft)         │                                                                         │
 /// │   └──────────┬────────────────┘                                                                         │
 /// │              │                                                                                          │
 /// │       ┌──────┴──────┐                                                                                   │
 /// │       │             │                                                                                   │
 /// │   ┌───▼───┐    ┌────▼────────────────┐                                                                  │
-/// │   │ Dim   │    │   DataSourceExec    │  partitioning=Hash([f_dkey]), output_ordering=[f_dkey]           │
+/// │   │ Dim   │    │   DataSourceExec    │  partitioning=Range([f_dkey ASC], ...), output_ordering=[f_dkey] │
 /// │   │ Table │    │  (fact, N groups)   │                                                                  │
 /// │   └───────┘    └─────────────────────┘                                                                  │
 /// └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -679,7 +679,7 @@ fn preserve_order_join_bench(
 /// │   └─────────────┬─────────────┘                                                                         │
 /// │                 │                                                                                       │
 /// │   ┌─────────────▼─────────────┐                                                                         │
-/// │   │     DataSourceExec        │ partitioning=Hash([f_dkey]), output_ordering=[f_dkey, timestamp]        │
+/// │   │     DataSourceExec        │ partitioning=Range([f_dkey ASC], ...), output_ordering=[f_dkey, timestamp]│
 /// │   │   file_groups={N groups}  │                                                                         │
 /// │   └───────────────────────────┘                                                                         │
 /// └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
