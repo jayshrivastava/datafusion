@@ -439,8 +439,9 @@ pub fn projection_exec(
 pub struct RequirementsTestExec {
     required_input_ordering: Option<LexOrdering>,
     required_input_distribution: Distribution,
+    input_distribution_requirements: Option<InputDistributionRequirements>,
     maintains_input_order: bool,
-    input: Arc<dyn ExecutionPlan>,
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
 }
 
 impl RequirementsTestExec {
@@ -448,8 +449,9 @@ impl RequirementsTestExec {
         Self {
             required_input_ordering: None,
             required_input_distribution: Distribution::UnspecifiedDistribution,
+            input_distribution_requirements: None,
             maintains_input_order: true,
-            input,
+            inputs: vec![input],
         }
     }
 
@@ -468,6 +470,21 @@ impl RequirementsTestExec {
         required_input_distribution: Distribution,
     ) -> Self {
         self.required_input_distribution = required_input_distribution;
+        self
+    }
+
+    /// Set concrete and/or co-partitioning requirements for the inputs.
+    pub fn with_input_distribution_requirements(
+        mut self,
+        requirements: InputDistributionRequirements,
+    ) -> Self {
+        self.input_distribution_requirements = Some(requirements);
+        self
+    }
+
+    /// Add another input for testing relationships between children.
+    pub fn with_additional_input(mut self, input: Arc<dyn ExecutionPlan>) -> Self {
+        self.inputs.push(input);
         self
     }
 
@@ -503,27 +520,36 @@ impl ExecutionPlan for RequirementsTestExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
+        self.inputs[0].properties()
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![
             self.required_input_ordering
                 .as_ref()
-                .map(|ordering| OrderingRequirements::from(ordering.clone())),
+                .map(|ordering| OrderingRequirements::from(ordering.clone()));
+            self.inputs.len()
         ]
     }
 
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {
-        InputDistributionRequirements::new(vec![self.required_input_distribution.clone()])
+        self.input_distribution_requirements
+            .clone()
+            .unwrap_or_else(|| {
+                InputDistributionRequirements::new(vec![
+                    self.required_input_distribution
+                        .clone();
+                    self.inputs.len()
+                ])
+            })
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![self.maintains_input_order]
+        vec![self.maintains_input_order; self.inputs.len()]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        self.inputs.iter().collect()
     }
 
     fn replace_children(
@@ -531,12 +557,14 @@ impl ExecutionPlan for RequirementsTestExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
         _: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1);
-        Ok(RequirementsTestExec::new(Arc::clone(&children[0]))
-            .with_required_input_ordering(self.required_input_ordering.clone())
-            .with_required_input_distribution(self.required_input_distribution.clone())
-            .with_maintains_input_order(self.maintains_input_order)
-            .into_arc())
+        assert_eq!(children.len(), self.inputs.len());
+        Ok(Arc::new(Self {
+            required_input_ordering: self.required_input_ordering.clone(),
+            required_input_distribution: self.required_input_distribution.clone(),
+            input_distribution_requirements: self.input_distribution_requirements.clone(),
+            maintains_input_order: self.maintains_input_order,
+            inputs: children,
+        }))
     }
 
     fn with_new_children(

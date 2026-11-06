@@ -19,8 +19,12 @@
 
 use std::sync::Arc;
 
+use datafusion_common::utils::compare_rows;
 use datafusion_common::{Result, internal_err};
-use datafusion_physical_expr::{Distribution, Partitioning, PartitioningSatisfaction};
+use datafusion_physical_expr::{
+    Distribution, EquivalenceProperties, Partitioning, PartitioningSatisfaction,
+    RangePartitioning,
+};
 
 use crate::execution_plan::{ExecutionPlan, ExecutionPlanProperties, InvariantLevel};
 
@@ -32,6 +36,8 @@ use crate::execution_plan::{ExecutionPlan, ExecutionPlanProperties, InvariantLev
 /// - [`Self::new`] describes independent per-child requirements.
 /// - [`Self::co_partitioned`] additionally requires child partitions with the
 ///   same index to cover compatible key ranges.
+/// - [`Self::try_with_child_partitioning`] additionally requires a concrete
+///   layout, including a partition count and any range bounds.
 ///
 /// For a single-input aggregate:
 ///
@@ -95,7 +101,10 @@ impl InputDistributionRequirements {
     pub fn new(per_child: Vec<Distribution>) -> Self {
         let children = per_child
             .into_iter()
-            .map(|distribution| ChildDistributionRequirement { distribution })
+            .map(|distribution| ChildDistributionRequirement {
+                distribution,
+                partitioning: None,
+            })
             .collect();
 
         Self {
@@ -135,7 +144,9 @@ impl InputDistributionRequirements {
     pub fn per_child_distributions(
         &self,
     ) -> impl ExactSizeIterator<Item = &Distribution> + '_ {
-        self.children.iter().map(|child| &child.distribution)
+        self.children
+            .iter()
+            .map(ChildDistributionRequirement::distribution)
     }
 
     /// Whether these requirements include a co-partitioning relationship between children.
@@ -147,16 +158,63 @@ impl InputDistributionRequirements {
     pub fn child_distribution(&self, child_idx: usize) -> Option<&Distribution> {
         self.children
             .get(child_idx)
-            .map(|child| &child.distribution)
+            .map(ChildDistributionRequirement::distribution)
+    }
+
+    /// Require a concrete partitioning for one child, in addition to its
+    /// [`Distribution`] requirement.
+    ///
+    /// Expressions refer to the child's schema. The partition count is fixed,
+    /// regardless of the optimizer's preferred parallelism. For a range layout,
+    /// the routing keys and split points must match, and the child's bounds must
+    /// fit within the required bounds; narrower child bounds are allowed.
+    /// [`Partitioning::UnknownPartitioning`] constrains only the partition count.
+    /// A one-partition layout also exposes the distribution as
+    /// [`Distribution::SinglePartition`].
+    ///
+    /// This does not authorize discarding rows. If the input does not prove that
+    /// all its rows fit within required bounds, distribution enforcement fails
+    /// rather than filtering the input or inserting an unsafe repartition.
+    pub fn try_with_child_partitioning(
+        mut self,
+        child_idx: usize,
+        partitioning: Partitioning,
+    ) -> Result<Self> {
+        let Some(child) = self.children.get_mut(child_idx) else {
+            return internal_err!(
+                "missing distribution requirement for child {child_idx}"
+            );
+        };
+        if partitioning.partition_count() == 0 {
+            return internal_err!(
+                "required partitioning must have at least one partition"
+            );
+        }
+        child.partitioning = Some(partitioning);
+        Ok(self)
+    }
+
+    /// Return the optional concrete partitioning requirement for a child.
+    pub fn child_partitioning(&self, child_idx: usize) -> Option<&Partitioning> {
+        self.children
+            .get(child_idx)
+            .and_then(|child| child.partitioning.as_ref())
     }
 
     /// Return the per-child distribution requirements.
     ///
-    /// WARNING: This intentionally drops any grouped relationship.
+    /// WARNING: This intentionally drops concrete partitioning requirements and
+    /// any grouped relationship.
     pub fn into_per_child(self) -> Vec<Distribution> {
         self.children
             .into_iter()
-            .map(|child| child.distribution)
+            .map(|child| {
+                if child.requires_single_partition() {
+                    Distribution::SinglePartition
+                } else {
+                    child.distribution
+                }
+            })
             .collect()
     }
 
@@ -175,11 +233,46 @@ impl InputDistributionRequirements {
             );
         };
 
+        if let Some(partitioning) = &requirement.partitioning
+            && !satisfies_partitioning(
+                child.output_partitioning(),
+                partitioning,
+                child.equivalence_properties(),
+            )?
+        {
+            return Ok(PartitioningSatisfaction::NotSatisfied);
+        }
+
         Ok(child.output_partitioning().satisfaction(
             &requirement.distribution,
             child.equivalence_properties(),
             options.allow_subset(),
         ))
+    }
+
+    /// Whether the child's known bounds allow a row-preserving repartition to
+    /// its concrete requirement. This does not check whether its current layout
+    /// already satisfies the requirement.
+    ///
+    /// # Public Only for Internal Use:
+    ///
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn can_repartition_child(
+        &self,
+        child_idx: usize,
+        child: &dyn ExecutionPlan,
+    ) -> Result<bool> {
+        match self.child_partitioning(child_idx) {
+            Some(required) => satisfies_bounds(
+                child.output_partitioning(),
+                required,
+                child.equivalence_properties(),
+            ),
+            None => Ok(true),
+        }
     }
 
     /// Return child indexes whose co-partitioning requirements are
@@ -205,7 +298,7 @@ impl InputDistributionRequirements {
         let Some(co_partitioned) = &self.co_partitioned else {
             return Ok(vec![]);
         };
-        if self.co_partitioning_satisfied(co_partitioned, children) {
+        if self.co_partitioning_satisfied(co_partitioned, children)? {
             return Ok(vec![]);
         }
 
@@ -223,6 +316,25 @@ impl InputDistributionRequirements {
         let children_len = children.len();
         if self.children.len() != children_len {
             return self.validate_shape(plan_name, children_len);
+        }
+
+        if matches!(check, InvariantLevel::Executable) {
+            for (idx, child) in children.iter().enumerate() {
+                if let Some(required) = self.child_partitioning(idx)
+                    && !self
+                        .child_satisfaction(
+                            idx,
+                            child.as_ref(),
+                            ChildSatisfactionOptions::new().with_allow_subset(true),
+                        )?
+                        .is_satisfied()
+                {
+                    return internal_err!(
+                        "{plan_name} requires child {idx} partitioning {required}, got {}",
+                        child.output_partitioning()
+                    );
+                }
+            }
         }
 
         if let Some(co_partitioned) = &self.co_partitioned {
@@ -249,7 +361,7 @@ impl InputDistributionRequirements {
             .into_iter()
             .map(|child| child.as_ref())
             .collect::<Vec<_>>();
-        if !self.co_partitioning_satisfied(co_partitioned, &children) {
+        if !self.co_partitioning_satisfied(co_partitioned, &children)? {
             return internal_err!(
                 "{} requires children {:?} to be co-partitioned",
                 plan_name,
@@ -279,7 +391,7 @@ impl InputDistributionRequirements {
             for &child in co_partitioned {
                 validate_child_index(plan_name, child, self.children.len(), &mut seen)?;
                 if matches!(
-                    self.children[child].distribution,
+                    self.children[child].distribution(),
                     Distribution::UnspecifiedDistribution
                 ) {
                     return internal_err!(
@@ -296,44 +408,33 @@ impl InputDistributionRequirements {
         &self,
         co_partitioned: &[usize],
         children: &[&dyn ExecutionPlan],
-    ) -> bool {
+    ) -> Result<bool> {
         let first_idx = co_partitioned[0];
-        let first_requirement = &self.children[first_idx];
         let first = children[first_idx];
         let first_partitioning = first.output_partitioning();
 
-        if !first_partitioning
-            .satisfaction(
-                &first_requirement.distribution,
-                first.equivalence_properties(),
-                false,
-            )
+        if !self
+            .child_satisfaction(first_idx, first, ChildSatisfactionOptions::new())?
             .is_satisfied()
         {
-            return false;
+            return Ok(false);
         }
 
         for &child_idx in co_partitioned.iter().skip(1) {
-            let requirement = &self.children[child_idx];
             let child = children[child_idx];
-            if !child
-                .output_partitioning()
-                .satisfaction(
-                    &requirement.distribution,
-                    child.equivalence_properties(),
-                    false,
-                )
+            if !self
+                .child_satisfaction(child_idx, child, ChildSatisfactionOptions::new())?
                 .is_satisfied()
                 || !compatible_co_partitioning_layout(
                     first_partitioning,
                     child.output_partitioning(),
                 )
             {
-                return false;
+                return Ok(false);
             }
         }
 
-        true
+        Ok(true)
     }
 }
 
@@ -341,6 +442,121 @@ impl InputDistributionRequirements {
 #[derive(Debug, Clone)]
 struct ChildDistributionRequirement {
     distribution: Distribution,
+    partitioning: Option<Partitioning>,
+}
+
+impl ChildDistributionRequirement {
+    fn requires_single_partition(&self) -> bool {
+        self.partitioning
+            .as_ref()
+            .is_some_and(|p| p.partition_count() == 1)
+    }
+
+    fn distribution(&self) -> &Distribution {
+        // Preserve a concrete one-partition constraint for rules that only
+        // inspect Distribution, such as sort parallelization. One partition
+        // already satisfies every key distribution.
+        if self.requires_single_partition() {
+            &Distribution::SinglePartition
+        } else {
+            &self.distribution
+        }
+    }
+}
+
+fn satisfies_partitioning(
+    source: &Partitioning,
+    required: &Partitioning,
+    eq_properties: &EquivalenceProperties,
+) -> Result<bool> {
+    if source.partition_count() != required.partition_count()
+        || !satisfies_bounds(source, required, eq_properties)?
+    {
+        return Ok(false);
+    }
+
+    // With one partition there is only one possible destination for every row.
+    if source.partition_count() == 1 {
+        return Ok(true);
+    }
+
+    Ok(match (source, required) {
+        (_, Partitioning::UnknownPartitioning(_)) => true,
+        (Partitioning::RoundRobinBatch(_), Partitioning::RoundRobinBatch(_)) => true,
+        (Partitioning::Hash(_, _), Partitioning::Hash(exprs, _)) => source
+            .satisfaction(
+                &Distribution::KeyPartitioned(exprs.clone()),
+                eq_properties,
+                false,
+            )
+            .is_satisfied(),
+        (Partitioning::Range(source), Partitioning::Range(required)) => {
+            source.split_points() == required.split_points()
+                && equivalent_range_ordering(source, required, eq_properties)
+        }
+        _ => false,
+    })
+}
+
+fn equivalent_range_ordering(
+    source: &RangePartitioning,
+    required: &RangePartitioning,
+    eq_properties: &EquivalenceProperties,
+) -> bool {
+    let eq_group = eq_properties.eq_group();
+    source.ordering().len() == required.ordering().len()
+        && source
+            .ordering()
+            .iter()
+            .zip(required.ordering())
+            .all(|(a, b)| {
+                a.options == b.options
+                    && (a.expr.eq(&b.expr)
+                        || eq_group
+                            .normalize_expr(Arc::clone(&a.expr))
+                            .eq(&eq_group.normalize_expr(Arc::clone(&b.expr))))
+            })
+}
+
+/// Bounds describe a domain in lexicographic sort order, including descending
+/// keys and null placement. A missing source bound cannot prove a finite limit.
+fn satisfies_bounds(
+    source: &Partitioning,
+    required: &Partitioning,
+    eq_properties: &EquivalenceProperties,
+) -> Result<bool> {
+    let Partitioning::Range(required) = required else {
+        return Ok(true);
+    };
+    if required.start_bound().is_none() && required.end_bound().is_none() {
+        return Ok(true);
+    }
+    let Partitioning::Range(source) = source else {
+        return Ok(false);
+    };
+    if !equivalent_range_ordering(source, required, eq_properties) {
+        return Ok(false);
+    }
+    let sort_options = required
+        .ordering()
+        .iter()
+        .map(|expr| expr.options)
+        .collect::<Vec<_>>();
+    for (lower, upper) in [
+        (required.start_bound(), source.start_bound()),
+        (source.end_bound(), required.end_bound()),
+    ] {
+        if let (Some(lower), Some(upper)) = (lower, upper)
+            && lower != upper
+            && compare_rows(lower.values(), upper.values(), &sort_options)?.is_gt()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(
+        (required.start_bound().is_none() || source.start_bound().is_some())
+            && (required.end_bound().is_none() || source.end_bound().is_some()),
+    )
 }
 
 fn validate_child_index(
