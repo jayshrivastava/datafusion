@@ -308,8 +308,8 @@ impl ExecutionPlan for SinglePartitionMaintainsOrderExec {
 
     fn input_distribution_requirements(
         &self,
-    ) -> datafusion_physical_plan::InputDistributionRequirements {
-        datafusion_physical_plan::InputDistributionRequirements::new(vec![
+    ) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
             Distribution::SinglePartition,
         ])
     }
