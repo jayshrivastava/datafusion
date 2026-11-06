@@ -78,7 +78,9 @@ use datafusion_physical_expr::{
     SplitPoint,
 };
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::execution_plan::ExecutionPlan;
+use datafusion_physical_plan::execution_plan::{
+    ExecutionPlan, InvariantLevel, reset_plan_states,
+};
 use datafusion_physical_plan::expressions::col;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::SortMergeJoinExec;
@@ -91,8 +93,9 @@ use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeE
 use datafusion_physical_plan::streaming::StreamingTableExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlanProperties,
-    PlanProperties, ReplaceChildrenOptions, collect, displayable,
+    ChildSatisfactionOptions, ChildrenPropertiesMode, DisplayAs, DisplayFormatType,
+    ExecutionPlanProperties, InputDistributionRequirements, PlanProperties,
+    ReplaceChildrenOptions, collect, displayable,
 };
 use insta::Settings;
 
@@ -305,8 +308,8 @@ impl ExecutionPlan for SinglePartitionMaintainsOrderExec {
 
     fn input_distribution_requirements(
         &self,
-    ) -> datafusion_physical_plan::InputDistributionRequirements {
-        datafusion_physical_plan::InputDistributionRequirements::new(vec![
+    ) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
             Distribution::SinglePartition,
         ])
     }
@@ -1770,6 +1773,308 @@ fn range_hash_join_repartitions_unpartitioned_side_to_match_range_with_bounds()
     Ok(())
 }
 
+fn bounded_range(
+    splits: impl IntoIterator<Item = i64>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> Result<Partitioning> {
+    let Partitioning::Range(range) =
+        range_partitioning("a", splits, SortOptions::default())?
+    else {
+        unreachable!()
+    };
+    let point = |value| SplitPoint::new(vec![ScalarValue::Int64(Some(value))]);
+    Ok(Partitioning::Range(
+        range.try_with_bounds(start.map(point), end.map(point))?,
+    ))
+}
+
+#[test]
+fn concrete_range_requirement_reuses_contained_bounds() -> Result<()> {
+    let source = parquet_exec_with_output_partitioning(bounded_range(
+        [10, 20, 30],
+        Some(0),
+        Some(35),
+    )?);
+    let requirements = InputDistributionRequirements::new(vec![
+        Distribution::KeyPartitioned(vec![col("a", &source.schema())?]),
+    ])
+    .try_with_child_partitioning(0, bounded_range([10, 20, 30], Some(0), Some(40))?)?;
+    let plan = RequirementsTestExec::new(source)
+        .with_input_distribution_requirements(requirements)
+        .into_arc();
+    // Preferred parallelism must not override an explicitly required count.
+    let config = TestConfig::default().with_query_execution_partitions(10);
+    let plan = config.try_to_plan(plan, &DISTRIB_DISTRIB_SORT)?;
+    SanityCheckPlan::new().optimize(Arc::clone(&plan), &config.config)?;
+    assert_plan!(plan, @r"
+    RequiredInputOrderingExec
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn concrete_range_requirement_repartitions_without_dropping_rows() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![0, 5, 15, 25, 34]))],
+    )?;
+    let memory = MemorySourceConfig::try_new(&[vec![batch]], schema, None)?;
+    let source: Arc<dyn ExecutionPlan> = Arc::new(
+        DataSourceExec::new(Arc::new(memory)).with_partitioning(bounded_range(
+            [],
+            Some(0),
+            Some(35),
+        )?),
+    );
+    let required = bounded_range([10, 20, 30], Some(0), Some(40))?;
+    let requirements =
+        InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution])
+            .try_with_child_partitioning(0, required.clone())?;
+    let plan = RequirementsTestExec::new(source)
+        .with_input_distribution_requirements(requirements)
+        .into_arc();
+    let config = TestConfig::default().with_query_execution_partitions(10);
+    let plan = config.try_to_plan(plan, &DISTRIB_DISTRIB_SORT)?;
+    SanityCheckPlan::new().optimize(Arc::clone(&plan), &config.config)?;
+    assert_plan!(plan, @r"
+    RequiredInputOrderingExec
+      RepartitionExec: partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40)), input_partitions=1
+        DataSourceExec: partitions=1, partition_sizes=[1]
+    ");
+    let input = Arc::clone(plan.children()[0]);
+    assert_eq!(input.output_partitioning(), &required);
+    let batches = collect(input, SessionContext::new().task_ctx()).await?;
+    #[rustfmt::skip]
+    let expected = [
+        "+----+", "| a  |", "+----+", "| 0  |", "| 5  |", "| 15 |", "| 25 |", "| 34 |", "+----+",
+    ];
+    datafusion_common::assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[test]
+fn concrete_range_requirement_rejects_unproven_bounds() -> Result<()> {
+    let required = bounded_range([10, 20, 30], Some(0), Some(40))?;
+    let sources = [
+        Partitioning::UnknownPartitioning(1),
+        Partitioning::Hash(vec![col("a", &schema())?], 4),
+        bounded_range([10, 20, 30], None, None)?,
+        bounded_range([10, 20, 30], Some(-1), Some(40))?,
+        bounded_range([10, 20, 30], Some(0), Some(41))?,
+        bounded_range([10, 20, 30], None, Some(40))?,
+        bounded_range([10, 20, 30], Some(0), None)?,
+    ];
+    for source in sources {
+        let input = parquet_exec_with_output_partitioning(source);
+        let requirements = InputDistributionRequirements::new(vec![
+            Distribution::KeyPartitioned(vec![col("a", &input.schema())?]),
+        ])
+        .try_with_child_partitioning(0, required.clone())?;
+        assert!(
+            !requirements
+                .child_satisfaction(0, input.as_ref(), ChildSatisfactionOptions::new())?
+                .is_satisfied()
+        );
+        let plan = RequirementsTestExec::new(input)
+            .with_input_distribution_requirements(requirements)
+            .into_arc();
+        assert!(plan.check_invariants(InvariantLevel::Executable).is_err());
+        let error = TestConfig::default()
+            .try_to_plan(plan, &DISTRIB_DISTRIB_SORT)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("input bounds do not prove that all rows fit"),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn concrete_partitioning_requirement_controls_copartitioning() -> Result<()> {
+    let required = bounded_range([10, 20, 30], Some(0), Some(40))?;
+    let other = bounded_range([11, 21, 31], None, None)?;
+    let requirements = InputDistributionRequirements::co_partitioned(vec![
+        Distribution::KeyPartitioned(vec![col("a", &schema())?]),
+        Distribution::KeyPartitioned(vec![col("a", &schema())?]),
+    ])
+    .try_with_child_partitioning(1, required.clone())?;
+    let make_plan = |requirements| {
+        RequirementsTestExec::new(parquet_exec_with_output_partitioning(other.clone()))
+            .with_additional_input(parquet_exec_with_output_partitioning(
+                required.clone(),
+            ))
+            .with_input_distribution_requirements(requirements)
+            .into_arc()
+    };
+    let config = TestConfig::default().with_query_execution_partitions(10);
+    let plan =
+        config.try_to_plan(make_plan(requirements.clone()), &DISTRIB_DISTRIB_SORT)?;
+    SanityCheckPlan::new().optimize(Arc::clone(&plan), &config.config)?;
+    assert_plan!(plan, @r"
+    RequiredInputOrderingExec
+      RepartitionExec: partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), input_partitions=4
+        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(11), (21), (31)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40)), file_type=parquet
+    ");
+
+    // A count-only requirement still permits aligning the routing scheme.
+    let count_requirement = requirements
+        .clone()
+        .try_with_child_partitioning(0, Partitioning::UnknownPartitioning(4))?;
+    let count_plan =
+        config.try_to_plan(make_plan(count_requirement), &DISTRIB_DISTRIB_SORT)?;
+    assert_plan!(count_plan, plan);
+
+    // Both layouts fit their own bounds, but their split points conflict. The
+    // optimizer must not replace either explicit requirement to align them.
+    let requirements = requirements.try_with_child_partitioning(0, other.clone())?;
+    let error = config
+        .try_to_plan(make_plan(requirements), &DISTRIB_DISTRIB_SORT)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("incompatible concrete partitioning requirements"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn concrete_range_requirement_compares_bounds_in_sort_order() -> Result<()> {
+    let make_range = |descending, nulls_first, start, end| {
+        RangePartitioning::try_new(
+            [PhysicalSortExpr {
+                expr: col("a", &schema())?,
+                options: SortOptions {
+                    descending,
+                    nulls_first,
+                },
+            }]
+            .into(),
+            vec![SplitPoint::new(vec![ScalarValue::Int64(Some(20))])],
+        )?
+        .try_with_bounds(
+            Some(SplitPoint::new(vec![ScalarValue::Int64(start)])),
+            Some(SplitPoint::new(vec![ScalarValue::Int64(end)])),
+        )
+        .map(Partitioning::Range)
+    };
+    // None here is a literal NULL bound, not an absent bound.
+    for (
+        descending,
+        nulls_first,
+        source_start,
+        source_end,
+        target_start,
+        target_end,
+        fits,
+    ) in [
+        (false, true, Some(0), Some(35), None, Some(40), true),
+        (false, true, None, Some(35), Some(0), Some(40), false),
+        (false, false, Some(0), Some(40), Some(0), None, true),
+        (false, false, Some(0), None, Some(0), Some(40), false),
+        (true, true, Some(35), Some(0), Some(40), Some(-5), true),
+        (true, true, Some(45), Some(0), Some(40), Some(-5), false),
+        (true, true, Some(35), Some(-10), Some(40), Some(-5), false),
+    ] {
+        let source = parquet_exec_with_output_partitioning(make_range(
+            descending,
+            nulls_first,
+            source_start,
+            source_end,
+        )?);
+        let requirements = InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution,
+        ])
+        .try_with_child_partitioning(
+            0,
+            make_range(descending, nulls_first, target_start, target_end)?,
+        )?;
+        assert_eq!(
+            requirements
+                .child_satisfaction(0, source.as_ref(), ChildSatisfactionOptions::new())?
+                .is_satisfied(),
+            fits
+        );
+        let plan = RequirementsTestExec::new(source)
+            .with_input_distribution_requirements(requirements)
+            .into_arc();
+        assert_eq!(
+            TestConfig::default()
+                .try_to_plan(plan, &DISTRIB_DISTRIB_SORT)
+                .is_ok(),
+            fits
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn concrete_partitioning_requirement_enforces_count_and_single_partition_bounds()
+-> Result<()> {
+    let key = col("a", &schema())?;
+    let config = TestConfig::default().with_query_execution_partitions(10);
+    for required in [
+        Partitioning::Hash(vec![Arc::clone(&key)], 2),
+        Partitioning::UnknownPartitioning(2),
+        Partitioning::UnknownPartitioning(1),
+    ] {
+        let source = parquet_exec_with_output_partitioning(Partitioning::Hash(
+            vec![Arc::clone(&key)],
+            4,
+        ));
+        let requirements = InputDistributionRequirements::new(vec![
+            Distribution::KeyPartitioned(vec![Arc::clone(&key)]),
+        ])
+        .try_with_child_partitioning(0, Partitioning::UnknownPartitioning(1))?
+        .try_with_child_partitioning(0, required.clone())?;
+        let plan = RequirementsTestExec::new(source)
+            .with_input_distribution_requirements(requirements.clone())
+            .into_arc();
+        let plan = config.try_to_plan(plan, &DISTRIB_DISTRIB_SORT)?;
+        assert_eq!(
+            plan.children()[0].output_partitioning().partition_count(),
+            required.partition_count()
+        );
+        assert!(
+            requirements
+                .child_satisfaction(
+                    0,
+                    plan.children()[0].as_ref(),
+                    ChildSatisfactionOptions::new()
+                )?
+                .is_satisfied()
+        );
+        SanityCheckPlan::new().optimize(plan, &config.config)?;
+    }
+
+    // The usual single-partition shortcut must not bypass a domain requirement.
+    let requirements =
+        InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution])
+            .try_with_child_partitioning(0, bounded_range([], Some(0), Some(40))?)?;
+    for (source, fits) in [
+        (Partitioning::UnknownPartitioning(1), false),
+        (bounded_range([], Some(0), Some(35))?, true),
+    ] {
+        let plan =
+            RequirementsTestExec::new(parquet_exec_with_output_partitioning(source))
+                .with_input_distribution_requirements(requirements.clone())
+                .into_arc();
+        assert_eq!(
+            config.try_to_plan(plan, &DISTRIB_DISTRIB_SORT).is_ok(),
+            fits
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn range_join_output_partitioning_depends_on_join_type() -> Result<()> {
     let range = RangePartitioning::try_new(
@@ -1778,10 +2083,7 @@ fn range_join_output_partitioning_depends_on_join_type() -> Result<()> {
             .map(|value| SplitPoint::new(vec![ScalarValue::Int64(Some(value))]))
             .to_vec(),
     )?;
-    let left_range = range.clone().try_with_bounds(
-        Some(SplitPoint::new(vec![ScalarValue::Int64(Some(0))])),
-        Some(SplitPoint::new(vec![ScalarValue::Int64(Some(40))])),
-    )?;
+    let left_range = range.clone();
     let right_range = range.try_with_bounds(
         Some(SplitPoint::new(vec![ScalarValue::Int64(Some(0))])),
         Some(SplitPoint::new(vec![ScalarValue::Int64(Some(35))])),
@@ -1789,7 +2091,7 @@ fn range_join_output_partitioning_depends_on_join_type() -> Result<()> {
     let left = parquet_exec_with_output_partitioning(Partitioning::Range(left_range));
     let right = parquet_exec_with_output_partitioning(Partitioning::Range(right_range));
     let join_on = vec![(col("a", &left.schema())?, col("a", &right.schema())?)];
-    let mut output_partitionings = Vec::new();
+    let mut plans = Vec::new();
 
     for join_type in [
         JoinType::Inner,
@@ -1808,34 +2110,237 @@ fn range_join_output_partitioning_depends_on_join_type() -> Result<()> {
             .with_query_execution_partitions(4)
             .to_plan(join, &DISTRIB_DISTRIB_SORT);
 
-        let (captured_join_type, modified_plan) =
-            hide_first(plan.as_ref(), r"join_type=(\w+)", "join_type=...");
-        assert_eq!(captured_join_type, join_type.to_string());
-        insta::allow_duplicates! {
-            insta::assert_snapshot!(modified_plan, @r"
-            HashJoinExec: mode=Partitioned, join_type=..., on=[(a@0, a@0)]
-              DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40)), file_type=parquet
-              DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
-            ");
-        }
-        output_partitionings.push(format!("{join_type}: {}", plan.output_partitioning()));
+        plans.push(format!(
+            "{}Output partitioning: {}",
+            displayable(plan.as_ref()).indent(true),
+            plan.output_partitioning(),
+        ));
     }
 
+    // The inputs have matching routing despite their different bounds.
     // The join type determines which input's partitioning can describe the output.
-    // In particular, unmatched left rows can have keys in [35, 40).
-    insta::assert_snapshot!(output_partitionings.join("\n"), @r"
-    Inner: Range([a@5 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
-    Left: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40))
-    Right: Range([a@5 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
-    Full: UnknownPartitioning(4)
-    LeftSemi: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40))
-    RightSemi: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
-    LeftAnti: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40))
-    RightAnti: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
-    LeftMark: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(40))
-    RightMark: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+    insta::assert_snapshot!(plans.join("\n\n"), @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@5 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+
+    HashJoinExec: mode=Partitioned, join_type=Right, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@5 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=Full, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: UnknownPartitioning(4)
+
+    HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+
+    HashJoinExec: mode=Partitioned, join_type=RightSemi, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=LeftAnti, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+
+    HashJoinExec: mode=Partitioned, join_type=RightAnti, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=LeftMark, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+
+    HashJoinExec: mode=Partitioned, join_type=RightMark, on=[(a@0, a@0)]
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+      DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35)), file_type=parquet
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
     ");
 
+    Ok(())
+}
+
+async fn check_range_join_outside_probe_bounds(
+    already_partitioned: bool,
+) -> Result<String> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = |values: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+    };
+    let point = |value| SplitPoint::new(vec![ScalarValue::Int64(Some(value))]);
+    let range = RangePartitioning::try_new(
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into(),
+        [10, 20, 30].map(point).to_vec(),
+    )?;
+    let probe_range = range
+        .clone()
+        .try_with_bounds(Some(point(0)), Some(point(35)))?;
+    let left_partitions = if already_partitioned {
+        vec![
+            vec![batch(vec![-1, 0, 5])?],
+            vec![batch(vec![15])?],
+            vec![batch(vec![25])?],
+            vec![batch(vec![35, 37, 40])?],
+        ]
+    } else {
+        vec![vec![batch(vec![-1, 0, 5, 15, 25, 35, 37, 40])?]]
+    };
+    let mut plans = Vec::new();
+
+    for join_type in [JoinType::Inner, JoinType::Left] {
+        let left =
+            MemorySourceConfig::try_new(&left_partitions, Arc::clone(&schema), None)?;
+        let mut left = DataSourceExec::new(Arc::new(left));
+        if already_partitioned {
+            left = left.with_partitioning(Partitioning::Range(range.clone()));
+        }
+        let right = MemorySourceConfig::try_new(
+            &[
+                vec![batch(vec![0, 5])?],
+                vec![batch(vec![15])?],
+                vec![batch(vec![25])?],
+                vec![batch(vec![30])?],
+            ],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let right = Arc::new(
+            DataSourceExec::new(Arc::new(right))
+                .with_partitioning(Partitioning::Range(probe_range.clone())),
+        );
+        let join_on = vec![(col("a", &schema)?, col("a", &schema)?)];
+        let join = hash_join_exec(Arc::new(left), right, &join_on, &join_type);
+        let plan = TestConfig::default()
+            .with_query_execution_partitions(4)
+            .to_plan(join, &DISTRIB_DISTRIB_SORT);
+        plans.push(format!(
+            "{}Left partitioning: {}\nRight partitioning: {}\nOutput partitioning: {}",
+            displayable(plan.as_ref()).indent(true),
+            plan.children()[0].output_partitioning(),
+            plan.children()[1].output_partitioning(),
+            plan.output_partitioning(),
+        ));
+
+        // The left input must still deliver rows outside the right input's bounds.
+        // Execute a fresh copy so checking it does not consume the join's exchange.
+        let left = reset_plan_states(Arc::clone(plan.children()[0]))?;
+        let batches = collect(left, SessionContext::new().task_ctx()).await?;
+        #[rustfmt::skip]
+        let expected_build_rows = [
+            "+----+",
+            "| a  |",
+            "+----+",
+            "| -1 |",
+            "| 0  |",
+            "| 5  |",
+            "| 15 |",
+            "| 25 |",
+            "| 35 |",
+            "| 37 |",
+            "| 40 |",
+            "+----+",
+        ];
+        datafusion_common::assert_batches_sorted_eq!(expected_build_rows, &batches);
+
+        // Only the join eliminates unmatched rows. The lower bound is inclusive,
+        // so key 0 matches; keys -1, 35, 37 and 40 cannot match the bounded probe.
+        let batches = collect(plan, SessionContext::new().task_ctx()).await?;
+        if join_type == JoinType::Inner {
+            datafusion_common::assert_batches_sorted_eq!(
+                [
+                    "+----+----+",
+                    "| a  | a  |",
+                    "+----+----+",
+                    "| 0  | 0  |",
+                    "| 5  | 5  |",
+                    "| 15 | 15 |",
+                    "| 25 | 25 |",
+                    "+----+----+",
+                ],
+                &batches
+            );
+        } else {
+            datafusion_common::assert_batches_sorted_eq!(
+                [
+                    "+----+----+",
+                    "| a  | a  |",
+                    "+----+----+",
+                    "| -1 |    |",
+                    "| 0  | 0  |",
+                    "| 5  | 5  |",
+                    "| 15 | 15 |",
+                    "| 25 | 25 |",
+                    "| 35 |    |",
+                    "| 37 |    |",
+                    "| 40 |    |",
+                    "+----+----+",
+                ],
+                &batches
+            );
+        }
+    }
+
+    Ok(plans.join("\n\n"))
+}
+
+#[tokio::test]
+async fn range_hash_join_repartition_bounds_preserve_unmatched_rows() -> Result<()> {
+    let plans = check_range_join_outside_probe_bounds(false).await?;
+    insta::assert_snapshot!(plans, @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]
+      RepartitionExec: partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), input_partitions=1
+        DataSourceExec: partitions=1, partition_sizes=[1]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    Left partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    Right partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+    Output partitioning: Range([a@1 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, a@0)]
+      RepartitionExec: partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), input_partitions=1
+        DataSourceExec: partitions=1, partition_sizes=[1]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    Left partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    Right partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_hash_join_matching_layouts_preserve_unmatched_rows() -> Result<()> {
+    let plans = check_range_join_outside_probe_bounds(true).await?;
+    insta::assert_snapshot!(plans, @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    Left partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    Right partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+    Output partitioning: Range([a@1 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+
+    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, a@0)]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    Left partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    Right partitioning: Range([a@0 ASC], [(10), (20), (30)], 4, start=(0), end=(35))
+    Output partitioning: Range([a@0 ASC], [(10), (20), (30)], 4)
+    ");
     Ok(())
 }
 

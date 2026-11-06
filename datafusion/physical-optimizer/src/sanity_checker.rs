@@ -176,6 +176,10 @@ pub fn check_plan_sanity(
             .is_satisfied()
         {
             let plan_str = get_plan_string(plan);
+            let dist_req = input_distributions.child_partitioning(idx).map_or_else(
+                || dist_req.to_string(),
+                |partitioning| format!("{dist_req}, partitioning={partitioning}"),
+            );
             return plan_err!(
                 "Plan: {:?} does not satisfy distribution requirements: {}. Child-{} output partitioning: {}",
                 plan_str,

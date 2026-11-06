@@ -1314,7 +1314,7 @@ fn enforce_distribution_relationships(
             }
         }
 
-        let best_satisfied_child: Option<(usize, Partitioning)> =
+        let mut best_satisfied_child: Option<(usize, Partitioning)> =
             match satisfied_children.len() {
                 0 => None,
                 1 => satisfied_children
@@ -1361,11 +1361,30 @@ fn enforce_distribution_relationships(
                 }
             };
 
+        // A concrete input requirement fixes its layout. Align unconstrained
+        // siblings to it rather than replacing it with a cheaper layout.
+        let fixed_child = unsatisfied_children
+            .iter()
+            .copied()
+            .filter(|&idx| input_distributions.child_partitioning(idx).is_some())
+            .min_by_key(|&idx| {
+                matches!(
+                    input_distributions.child_partitioning(idx),
+                    Some(Partitioning::UnknownPartitioning(_))
+                )
+            });
+        if let Some(idx) = fixed_child {
+            best_satisfied_child = Some((
+                idx,
+                children[idx].context.plan.output_partitioning().clone(),
+            ));
+        }
+
         // Validate that best_satisfied_child can be adapted across all unsatisfied children in the group
         let best_satisfied_child =
             best_satisfied_child.filter(|(ref_idx, ref_partitioning)| {
                 unsatisfied_children.iter().all(|&child_idx| {
-                    if child_idx == *ref_idx {
+                    if child_idx == *ref_idx || ref_partitioning.partition_count() == 1 {
                         true
                     } else {
                         ref_partitioning
@@ -1377,6 +1396,12 @@ fn enforce_distribution_relationships(
                     }
                 })
             });
+
+        if fixed_child.is_some() && best_satisfied_child.is_none() {
+            return datafusion_common::plan_err!(
+                "{plan_name} has a concrete partitioning requirement that cannot be adapted to its co-partitioned children"
+            );
+        }
 
         let mut changed = false;
         for child_idx in unsatisfied_children {
@@ -1402,6 +1427,13 @@ fn enforce_distribution_relationships(
                 if let Some((ref_idx, ref_partitioning)) = &best_satisfied_child {
                     if *ref_idx == child_idx {
                         None
+                    } else if ref_partitioning.partition_count() == 1 {
+                        Some(
+                            children[child_idx]
+                                .requirement
+                                .clone()
+                                .create_partitioning(1),
+                        )
                     } else {
                         ref_partitioning.adapt(
                             &children[child_idx].requirement,
@@ -1416,6 +1448,15 @@ fn enforce_distribution_relationships(
                 Distribution::KeyPartitioned(exprs.to_vec())
                     .create_partitioning(target_partitions)
             });
+
+            if let Some(required) = input_distributions.child_partitioning(child_idx) {
+                // A count-only requirement permits changing the routing scheme
+                // while retaining the count. Other explicit layouts are fixed.
+                if !matches!(required, Partitioning::UnknownPartitioning(count) if *count == partitioning.partition_count())
+                {
+                    continue;
+                }
+            }
 
             let already_satisfied = match (
                 &partitioning,
@@ -1468,6 +1509,11 @@ fn enforce_distribution_relationships(
         }
 
         if !changed {
+            if fixed_child.is_some() {
+                return datafusion_common::plan_err!(
+                    "{plan_name} has incompatible concrete partitioning requirements for co-partitioned children"
+                );
+            }
             return datafusion_common::internal_err!(
                 "{plan_name} has distribution relationships that could not be enforced"
             );
@@ -1681,6 +1727,56 @@ pub fn ensure_distribution_with_stats(
                     && current_partitions < target_partitions))
                 && !is_partitioned_join
                 && !requires_grouping_id;
+
+            if let Some(partitioning) = input_distributions.child_partitioning(child_idx) {
+                let options = ChildSatisfactionOptions::new()
+                    .with_allow_subset(allow_subset_satisfy_partitioning);
+                if !input_distributions
+                    .child_satisfaction(child_idx, child.plan.as_ref(), options)?
+                    .is_satisfied()
+                {
+                    if !input_distributions.can_repartition_child(child_idx, child.plan.as_ref())? {
+                        return datafusion_common::plan_err!(
+                            "{} cannot repartition child {child_idx} from {} to {partitioning}: input bounds do not prove that all rows fit within the required bounds",
+                            plan.name(),
+                            child.plan.output_partitioning()
+                        );
+                    }
+                    if matches!(partitioning, Partitioning::UnknownPartitioning(1)) {
+                        child = add_merge_on_top(child);
+                    } else {
+                        let partitioning = match partitioning {
+                            Partitioning::UnknownPartitioning(count) => match &requirement {
+                                Distribution::HashPartitioned(_) | Distribution::KeyPartitioned(_) => {
+                                    requirement.clone().create_partitioning(*count)
+                                }
+                                _ => Partitioning::RoundRobinBatch(*count),
+                            },
+                            partitioning => partitioning.clone(),
+                        };
+                        let repartition = RepartitionExec::try_new(
+                            Arc::clone(&child.plan),
+                            partitioning,
+                        )?.with_preserve_order();
+                        child = DistributionContext::new(Arc::new(repartition), true, vec![child]);
+                    }
+                    if !input_distributions
+                        .child_satisfaction(child_idx, child.plan.as_ref(), options)?
+                        .is_satisfied()
+                    {
+                        return datafusion_common::plan_err!(
+                            "{} has conflicting distribution {requirement} and partitioning {partitioning} requirements for child {child_idx}",
+                            plan.name()
+                        );
+                    }
+                }
+                return Ok(DistributionChildState {
+                    context: child,
+                    required_input_ordering,
+                    maintains_input_order: maintains,
+                    requirement,
+                });
+            }
 
             let increases_partition_count = current_partitions < target_partitions;
 
